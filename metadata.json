@@ -1,0 +1,6 @@
+{
+  "name": "Smart Science AI — التعليم العلمي الذكي والتعلم الشامل",
+  "description": "منصة علوم ذكية تضم مساعداً تعليمياً بالصوت والكتابة ومنظومة تعلم شامل لذوي الهمم مع قارئ نصوص، ترجمة صوتية، وصف بصري للرسوم العلمية، وتبسيط المحتوى.",
+  "requestFramePermissions": ["microphone", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
