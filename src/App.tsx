@@ -35,6 +35,8 @@ import {
   speakWithBrowser,
   stopAllSpeech,
 } from "./utils/speech.ts";
+import { ApiResponseError, safeFetchJson } from "./utils/apiClient.ts";
+import { fetchCapabilities } from "./utils/aiApi.ts";
 
 type ActiveTab = "home" | "library" | "studio" | "radar" | "kahoot" | "chatbot" | "inclusive";
 type InclusiveSubTab = "discover" | "simulation" | "hub" | "adaptive_quiz" | "privacy";
@@ -188,16 +190,18 @@ export default function App() {
     }
   }, []);
 
-  // Load lessons from SQLite & fetch live capabilities
-  useEffect(() => {
-    fetch("/api/capabilities")
-      .then((r) => r.json())
+  const refreshCapabilities = useCallback(() => {
+    fetchCapabilities()
       .then((data) => setCapabilities(data))
       .catch(() => setCapabilities(null));
+  }, []);
 
-    fetch("/api/lessons")
-      .then((r) => r.json())
-      .then((data) => {
+  // Load lessons from SQLite & fetch live capabilities
+  useEffect(() => {
+    refreshCapabilities();
+
+    safeFetchJson<{ lessons?: LessonData[] }>("/api/lessons")
+      .then(({ data }) => {
         if (Array.isArray(data.lessons) && data.lessons.length > 0) {
           setLessons(data.lessons);
           const firstChem =
@@ -212,15 +216,14 @@ export default function App() {
         // Keep INITIAL_LESSONS fallback
       });
 
-    fetch("/api/prep-templates")
-      .then((r) => r.json())
-      .then((data) => {
+    safeFetchJson<{ templates?: PreparationTemplate[] }>("/api/prep-templates")
+      .then(({ data }) => {
         if (Array.isArray(data.templates)) {
           setPrepTemplates(data.templates);
         }
       })
       .catch(() => {});
-  }, []);
+  }, [refreshCapabilities]);
 
   // Persist accessibility settings & apply CSS root tokens
   useEffect(() => {
@@ -340,23 +343,34 @@ export default function App() {
   );
 
   const handleSaveNewLesson = async (newLesson: LessonData) => {
-    const res = await fetch("/api/lessons", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(newLesson),
-    });
-    const data = await res.json();
-    const saved: LessonData = data.lesson || newLesson;
-    setLessons((prev) => [saved, ...prev.filter((l) => l.id !== saved.id)]);
-    setSelectedSubject(saved.subjectId);
-    setSelectedLessonId(saved.id);
+    try {
+      const { data } = await safeFetchJson<{ lesson?: LessonData }>("/api/lessons", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newLesson),
+      });
+      const saved: LessonData = data.lesson || newLesson;
+      setLessons((prev) => [saved, ...prev.filter((l) => l.id !== saved.id)]);
+      setSelectedSubject(saved.subjectId);
+      setSelectedLessonId(saved.id);
+    } catch {
+      setLessons((prev) => [newLesson, ...prev.filter((l) => l.id !== newLesson.id)]);
+      setSelectedSubject(newLesson.subjectId);
+      setSelectedLessonId(newLesson.id);
+    }
   };
 
   const handleDeleteLesson = async (lessonId: string) => {
-    const res = await fetch(`/api/lessons/${encodeURIComponent(lessonId)}`, {
-      method: "DELETE",
-    });
-    if (!res.ok) return;
+    try {
+      await safeFetchJson(`/api/lessons/${encodeURIComponent(lessonId)}`, {
+        method: "DELETE",
+      });
+    } catch (err) {
+      if (err instanceof ApiResponseError && err.status === 400) {
+        return;
+      }
+      // Continue local removal if remote Worker is stateless
+    }
     setLessons((prev) => {
       const next = prev.filter((l) => l.id !== lessonId);
       if (selectedLessonId === lessonId && next.length > 0) {
@@ -595,7 +609,7 @@ export default function App() {
       })
     );
     if (updatedLesson) {
-      fetch(`/api/lessons/${encodeURIComponent(lessonId)}`, {
+      safeFetchJson(`/api/lessons/${encodeURIComponent(lessonId)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(updatedLesson),
@@ -630,7 +644,7 @@ export default function App() {
       })
     );
     if (updatedLesson) {
-      fetch(`/api/lessons/${encodeURIComponent(lessonId)}`, {
+      safeFetchJson(`/api/lessons/${encodeURIComponent(lessonId)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(updatedLesson),
@@ -742,7 +756,15 @@ export default function App() {
                 className="w-8 h-8 rounded-full object-cover border shrink-0"
                 style={{ borderColor: "var(--border-hairline)" }}
               />
-              <span>smart science ai</span>
+              <div className="flex flex-col leading-tight">
+                <span>smart science ai</span>
+                <span
+                  className="text-[11px] font-semibold tracking-normal"
+                  style={{ color: "var(--accent-primary)" }}
+                >
+                  {isAr ? "إعداد المعلمة أمجاد المري" : "Prepared by Teacher Amjad Al-Marri"}
+                </span>
+              </div>
             </a>
 
             {/* Zone 2: Workspace Navigation Links (Visible only on Page 2 after entering) */}
@@ -1274,6 +1296,7 @@ export default function App() {
                             onClearAllStudentData={handleClearAllStudentData}
                             onExportStudentData={handleExportStudentData}
                             capabilities={capabilities}
+                            onRefreshCapabilities={refreshCapabilities}
                             uiLang={uiLang}
                           />
                         )}

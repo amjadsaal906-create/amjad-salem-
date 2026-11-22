@@ -200,6 +200,22 @@ export function createSmartBoardCanvas(maxAnisotropy: number): SmartBoardCanvasH
     };
     ctx.fillText(titles[mode], 102, 50);
 
+    // Teacher attribution on the Smart Board header
+    ctx.save();
+    if ("direction" in ctx) {
+      ctx.direction = lang === "ar" ? "rtl" : "ltr";
+    }
+    ctx.fillStyle = "#A4CBBF";
+    ctx.font = "bold 17px sans-serif";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ctx.fillText(
+      lang === "ar" ? "إعداد المعلمة أمجاد المري" : "Prepared by Teacher Amjad Al-Marri",
+      width - 46,
+      50
+    );
+    ctx.restore();
+
     // Mode graphic on left/center
     const cx = 310;
     const cy = 286;

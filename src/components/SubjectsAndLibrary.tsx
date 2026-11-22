@@ -35,6 +35,13 @@ import type {
 } from "../types.ts";
 import { SUBJECTS } from "../data/lessons.ts";
 import { prepareUploadPayload, inferUploadMimeType } from "../utils/chunkUpload.ts";
+import {
+  extractLessonFromFile,
+  fetchBooks,
+  generateLessonPlan,
+  generatePowerPointDeck,
+  saveLessonArtifact,
+} from "../utils/aiApi.ts";
 import { SubjectSculpture } from "./SubjectSculptures.tsx";
 import { PreparationFormCard } from "./PreparationFormCard.tsx";
 import { BooksLibrarySection } from "./BooksLibrarySection.tsx";
@@ -129,13 +136,8 @@ export const SubjectsAndLibrary: React.FC<SubjectsAndLibraryProps> = ({
   const [uploadSuccess, setUploadSuccess] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch("/api/books")
-      .then((r) => r.json())
-      .then((data) => {
-        if (Array.isArray(data.books)) {
-          setBooks(data.books);
-        }
-      })
+    fetchBooks()
+      .then((list) => setBooks(list))
       .catch(() => {});
   }, []);
 
@@ -159,30 +161,21 @@ export const SubjectsAndLibrary: React.FC<SubjectsAndLibraryProps> = ({
         : "Building & saving lesson plan from Preparation Form..."
     );
 
-    const planRes = await fetch("/api/generate/lesson-plan", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        lesson: targetLesson,
-        language: uiLang,
-        sourcePolicy,
-        prepTemplateId: activePrepTemplate?.id || targetLesson.prepTemplateId || "",
-        prepTemplate: activePrepTemplate,
-      }),
+    const planData = await generateLessonPlan({
+      lesson: targetLesson,
+      language: uiLang,
+      sourcePolicy,
+      prepTemplateId: activePrepTemplate?.id || targetLesson.prepTemplateId || "",
+      prepTemplate: activePrepTemplate,
     });
-    const planData = await planRes.json();
-    if (planRes.ok && planData.lessonPlan) {
+    if (planData.lessonPlan) {
       generatedPlan = planData.lessonPlan;
-      await fetch("/api/artifacts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          lessonId: targetLesson.id,
-          artifactType: "lesson_plan",
-          title: generatedPlan.lessonTitle || targetLesson.title,
-          data: generatedPlan,
-        }),
-      });
+      saveLessonArtifact({
+        lessonId: targetLesson.id,
+        artifactType: "lesson_plan",
+        title: generatedPlan.lessonTitle || targetLesson.title,
+        data: generatedPlan,
+      }).catch(() => {});
       planOk = true;
     }
 
@@ -192,30 +185,21 @@ export const SubjectsAndLibrary: React.FC<SubjectsAndLibraryProps> = ({
         : "Building & saving PowerPoint deck from Preparation Form..."
     );
 
-    const pptRes = await fetch("/api/generate/presentation", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        lesson: targetLesson,
-        slideCount: 7,
-        language: uiLang,
-        prepTemplateId: activePrepTemplate?.id || targetLesson.prepTemplateId || "",
-        prepTemplate: activePrepTemplate,
-        lessonPlan: generatedPlan,
-      }),
+    const pptData = await generatePowerPointDeck({
+      lesson: targetLesson,
+      slideCount: 7,
+      language: uiLang,
+      prepTemplateId: activePrepTemplate?.id || targetLesson.prepTemplateId || "",
+      prepTemplate: activePrepTemplate,
+      lessonPlan: generatedPlan,
     });
-    const pptData = await pptRes.json();
-    if (pptRes.ok && pptData.deck) {
-      await fetch("/api/artifacts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          lessonId: targetLesson.id,
-          artifactType: "presentation",
-          title: pptData.deck.deckTitle || targetLesson.title,
-          data: pptData.deck,
-        }),
-      });
+    if (pptData.deck) {
+      saveLessonArtifact({
+        lessonId: targetLesson.id,
+        artifactType: "presentation",
+        title: pptData.deck.deckTitle || targetLesson.title,
+        data: pptData.deck,
+      }).catch(() => {});
       deckOk = true;
     }
 
@@ -278,45 +262,15 @@ export const SubjectsAndLibrary: React.FC<SubjectsAndLibraryProps> = ({
           : "Analyzing lesson file and extracting concepts & objectives..."
       );
 
-      const res = await fetch("/api/extract-lesson", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileName: file.name,
-          mimeType: detectedMime,
-          ...prepared,
-          subjectName: isAr ? subjectMeta.nameAr : subjectMeta.nameEn,
-          gradeLevel,
-          prepTemplateId: activePrepTemplate?.id || "",
-          prepTemplate: activePrepTemplate,
-        }),
+      const data = await extractLessonFromFile({
+        fileName: file.name,
+        mimeType: detectedMime,
+        ...prepared,
+        subjectName: isAr ? subjectMeta.nameAr : subjectMeta.nameEn,
+        gradeLevel,
+        prepTemplateId: activePrepTemplate?.id || "",
+        prepTemplate: activePrepTemplate,
       });
-
-      const rawText = await res.text();
-      let data: {
-        title?: string;
-        summary?: string;
-        simplifiedSummary?: string;
-        content?: string;
-        category?: string;
-        extractedAnalysis?: LessonData["extractedAnalysis"];
-        message?: string;
-      } = {};
-      try {
-        data = JSON.parse(rawText);
-      } catch {
-        // Non-JSON proxy or HTML error response
-      }
-
-      if (!res.ok) {
-        setUploadError(
-          data.message ||
-            (isAr
-              ? `تعذر تحليل ملف الدرس (رمز الاستجابة ${res.status}).`
-              : `Failed to extract lesson file (${res.status}).`)
-        );
-        return;
-      }
 
       const title = manualTitle.trim() || data.title || file.name.replace(/\.[^.]+$/, "");
       const newLesson: LessonData = {
@@ -367,10 +321,11 @@ export const SubjectsAndLibrary: React.FC<SubjectsAndLibraryProps> = ({
               ? " وتم حفظ الجزء المتاح في استوديو المحتوى."
               : " Partial studio outputs were saved.";
           }
-        } catch {
+        } catch (prepErr) {
+          const prepReason = prepErr instanceof Error && prepErr.message ? ` (${prepErr.message})` : "";
           extraStatus = isAr
-            ? " (تم حفظ الدرس بنجاح، ويمكنك بناء التحضير والعرض لاحقاً من استوديو المحتوى)."
-            : " (Lesson saved; you can build Plan & PPTX from Content Studio).";
+            ? ` — تم حفظ الدرس، لكن تعذر التوليد التلقائي للتحضير/العرض${prepReason}.`
+            : ` (Lesson saved, but auto-build failed${prepReason}).`;
         }
       }
 
@@ -418,8 +373,14 @@ export const SubjectsAndLibrary: React.FC<SubjectsAndLibraryProps> = ({
             : "Could not complete auto-building plan/presentation right now."
         );
       }
-    } catch {
-      setUploadError(isAr ? "تعذر بناء التحضير والعرض." : "Auto-build failed.");
+    } catch (err) {
+      setUploadError(
+        err instanceof Error && err.message
+          ? err.message
+          : isAr
+            ? "تعذر بناء التحضير والعرض."
+            : "Auto-build failed."
+      );
     } finally {
       setAutoBuilding(false);
       setUploadStepText(null);

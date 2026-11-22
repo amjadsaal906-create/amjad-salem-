@@ -14,6 +14,7 @@ import type {
 } from "../types.ts";
 
 import { buildDemoDailyFact } from "../utils/demoSamples.ts";
+import { fetchDailyScienceFact } from "../utils/aiApi.ts";
 
 interface DailyScienceFactProps {
   uiLang: UILanguage;
@@ -112,29 +113,23 @@ export const DailyScienceFact: React.FC<DailyScienceFactProps> = ({
       }
 
       try {
-        const params = new URLSearchParams({
+        const liveFact = await fetchDailyScienceFact({
           lang: uiLang,
           date: todayKey,
+          refresh: forceRefresh,
         });
-        if (forceRefresh) params.set("refresh", "true");
-
-        const res = await fetch(`/api/daily-fact?${params.toString()}`);
-        const data = await res.json();
-        if (!res.ok || !data.fact) {
-          throw new Error(
-            data.message ||
-              (isAr
-                ? "تعذر جلب الحقيقة العلمية اليومية."
-                : "Unable to load today's science fact.")
-          );
-        }
-        setFact(data.fact as DailyScienceFactData);
+        setFact(liveFact);
         setIsDemoFact(false);
-      } catch {
-        // Automatic graceful preset Demo fallback with explicit non-AI badge
-        setFact(buildDemoDailyFact(uiLang, todayKey));
-        setIsDemoFact(true);
-        setError(null);
+      } catch (err) {
+        setFact(null);
+        setIsDemoFact(false);
+        setError(
+          err instanceof Error
+            ? err.message
+            : isAr
+              ? "تعذر الاتصال بخادم الذكاء الاصطناعي لجلب حقيقة اليوم."
+              : "Failed to connect to AI server for today's science fact."
+        );
       } finally {
         setLoading(false);
         setRefreshing(false);

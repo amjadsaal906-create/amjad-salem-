@@ -31,6 +31,14 @@ import type {
   UILanguage,
 } from "../types.ts";
 import { prepareUploadPayload, inferUploadMimeType } from "../utils/chunkUpload.ts";
+import { resolveApiUrl } from "../utils/apiClient.ts";
+import {
+  analyzeBookIndex,
+  deleteBook,
+  extractBookLesson,
+  fetchBooks,
+  saveBook,
+} from "../utils/aiApi.ts";
 
 interface BooksLibrarySectionProps {
   uiLang: UILanguage;
@@ -97,13 +105,10 @@ export const BooksLibrarySection: React.FC<BooksLibrarySectionProps> = ({
   }, [selectedSubject]);
 
   useEffect(() => {
-    fetch("/api/books")
-      .then((r) => r.json())
-      .then((data) => {
-        if (Array.isArray(data.books)) {
-          setBooks(data.books);
-          onBooksChange?.(data.books);
-        }
+    fetchBooks()
+      .then((list) => {
+        setBooks(list);
+        onBooksChange?.(list);
       })
       .catch(() => {});
   }, []);
@@ -164,13 +169,8 @@ export const BooksLibrarySection: React.FC<BooksLibrarySectionProps> = ({
     );
 
     try {
-      const res = await fetch(`/api/books/${encodeURIComponent(bookId)}/analyze`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ language: uiLang }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.book) {
+      const data = await analyzeBookIndex(bookId, uiLang);
+      if (!data.book) {
         throw new Error(
           data.message ||
             (isAr ? "تعذر استخراج فهرس الكتاب بالذكاء الاصطناعي." : "Failed to index book.")
@@ -251,33 +251,22 @@ export const BooksLibrarySection: React.FC<BooksLibrarySectionProps> = ({
 
       const subjMeta = SUBJECTS.find((s) => s.id === bookSubject) || SUBJECTS[0];
 
-      const saveRes = await fetch("/api/books", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          subjectId: bookSubject,
-          subjectName: isAr ? subjMeta.nameAr : subjMeta.nameEn,
-          stage: bookStage,
-          gradeLevel: bookGrade.trim() || (isAr ? "الصف العاشر" : "Grade 10"),
-          title: bookTitle.trim() || file.name.replace(/\.[^.]+$/, ""),
-          fileName: file.name,
-          mimeType: inferUploadMimeType(file),
-          ...prepared,
-          autoAnalyze: false,
-          language: uiLang,
-        }),
+      const saveData = await saveBook({
+        subjectId: bookSubject,
+        subjectName: isAr ? subjMeta.nameAr : subjMeta.nameEn,
+        stage: bookStage,
+        gradeLevel: bookGrade.trim() || (isAr ? "الصف العاشر" : "Grade 10"),
+        title: bookTitle.trim() || file.name.replace(/\.[^.]+$/, ""),
+        fileName: file.name,
+        mimeType: inferUploadMimeType(file),
+        ...prepared,
+        autoAnalyze: false,
+        language: uiLang,
       });
 
-      const saveRaw = await saveRes.text();
-      let saveData: { book?: BookRecord; message?: string } = {};
-      try {
-        saveData = JSON.parse(saveRaw);
-      } catch {
-        // Ignore parse error
-      }
-      if (!saveRes.ok || !saveData.book) {
+      if (!saveData.book) {
         throw new Error(
-          saveData.message || (isAr ? `تعذر حفظ الكتاب في المنصة (${saveRes.status}).` : "Failed to store book.")
+          saveData.message || (isAr ? "تعذر حفظ الكتاب في المنصة." : "Failed to store book.")
         );
       }
 
@@ -323,21 +312,16 @@ export const BooksLibrarySection: React.FC<BooksLibrarySectionProps> = ({
     );
 
     try {
-      const res = await fetch(`/api/books/${encodeURIComponent(activeBook.id)}/extract-lesson`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          unitId: unit.id,
-          chapterId: chapter.id,
-          lessonEntryId: lesson.id,
-          lessonTitle: lesson.title,
-          startPage: lesson.startPage,
-          endPage: lesson.endPage,
-          language: uiLang,
-        }),
+      const data = await extractBookLesson(activeBook.id, {
+        unitId: unit.id,
+        chapterId: chapter.id,
+        lessonEntryId: lesson.id,
+        lessonTitle: lesson.title,
+        startPage: lesson.startPage,
+        endPage: lesson.endPage,
+        language: uiLang,
       });
-      const data = await res.json();
-      if (!res.ok || !data.extracted) {
+      if (!data.extracted) {
         throw new Error(
           data.message || (isAr ? "تعذر استخراج محتوى الدرس من صفحات الكتاب." : "Failed page extraction.")
         );
@@ -396,15 +380,11 @@ export const BooksLibrarySection: React.FC<BooksLibrarySectionProps> = ({
 
   const handleDeleteBook = async (bookId: string) => {
     try {
-      const res = await fetch(`/api/books/${encodeURIComponent(bookId)}`, {
-        method: "DELETE",
-      });
-      if (res.ok) {
-        setBooks((prev) => prev.filter((b) => b.id !== bookId));
-        if (activeBookId === bookId) {
-          setActiveBookId(null);
-          setSelectedEntry(null);
-        }
+      await deleteBook(bookId);
+      setBooks((prev) => prev.filter((b) => b.id !== bookId));
+      if (activeBookId === bookId) {
+        setActiveBookId(null);
+        setSelectedEntry(null);
       }
     } catch {
       // Ignore
@@ -821,7 +801,7 @@ export const BooksLibrarySection: React.FC<BooksLibrarySectionProps> = ({
                     </button>
 
                     <a
-                      href={`/api/books/${encodeURIComponent(bk.id)}/file`}
+                      href={resolveApiUrl(`/api/books/${encodeURIComponent(bk.id)}/file`)}
                       target="_blank"
                       rel="noreferrer"
                       onClick={(ev) => ev.stopPropagation()}

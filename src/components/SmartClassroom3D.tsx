@@ -652,24 +652,27 @@ export const SmartClassroom3D: React.FC<SmartClassroom3DProps> = ({
       {/* Minimal Top Brand Badge & Interactive Hover Cue */}
       <div className="relative z-10 pointer-events-none p-4 flex flex-wrap items-start justify-between gap-3">
         <div
-          className="pointer-events-auto flex items-center gap-2.5 px-3 py-2 rounded-2xl border shadow-sm"
+          className="pointer-events-auto flex items-center gap-2.5 px-3.5 py-2 rounded-2xl border shadow-sm"
           style={{
-            backgroundColor: "rgba(250, 246, 238, 0.92)",
-            borderColor: "rgba(137, 161, 133, 0.4)",
+            backgroundColor: "rgba(250, 246, 238, 0.94)",
+            borderColor: "rgba(47, 107, 91, 0.32)",
           }}
         >
           <img
             src="/assets/aistudio/image_cbd252d9.png"
             alt={isAr ? "شعار Smart Science AI" : "Smart Science AI Emblem"}
             referrerPolicy="no-referrer"
-            className="w-8 h-8 rounded-full object-cover border"
-            style={{ borderColor: "rgba(137, 161, 133, 0.45)" }}
+            className="w-8 h-8 rounded-full object-cover border shrink-0"
+            style={{ borderColor: "rgba(47, 107, 91, 0.38)" }}
           />
-          <div className="leading-tight">
+          <div className="leading-tight space-y-0.5">
             <div className="text-xs font-bold" style={{ color: "#1d332d" }}>
               smart science ai
             </div>
-            <div className="text-[11px]" style={{ color: "#4e6961" }}>
+            <div className="text-[11px] font-bold" style={{ color: "#2f6b5b" }}>
+              {isAr ? "إعداد المعلمة أمجاد المري" : "Prepared by Teacher Amjad Al-Marri"}
+            </div>
+            <div className="text-[10px]" style={{ color: "#4e6961" }}>
               {isAr
                 ? "اسحب للتدوير · انقر على الروبوت أو السبورة"
                 : "Drag to orbit · Click Robot or Smart Board"}

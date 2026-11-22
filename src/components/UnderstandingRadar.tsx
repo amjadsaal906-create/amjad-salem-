@@ -65,6 +65,15 @@ import {
   stopAllSpeech,
 } from "../utils/speech.ts";
 import { buildDemoRadarQuestions } from "../utils/demoSamples.ts";
+import { getAiPhaseMessage, type AiRequestPhase } from "../utils/apiClient.ts";
+import {
+  askRadarTutor,
+  extractRadarSource,
+  fetchBooks,
+  fetchRadarSessions,
+  generateRadarQuestions,
+  requestRadarIntervention,
+} from "../utils/aiApi.ts";
 
 interface UnderstandingRadarProps {
   lessons: LessonData[];
@@ -170,6 +179,7 @@ export const UnderstandingRadar: React.FC<UnderstandingRadarProps> = ({
 
   const [questions, setQuestions] = useState<RadarQuestion[]>([]);
   const [isGeneratingQuestions, setIsGeneratingQuestions] = useState(false);
+  const [questionPhase, setQuestionPhase] = useState<AiRequestPhase>("idle");
   const [setupError, setSetupError] = useState<string | null>(null);
   const [editingQuestionId, setEditingQuestionId] = useState<string | null>(null);
 
@@ -240,14 +250,11 @@ export const UnderstandingRadar: React.FC<UnderstandingRadarProps> = ({
 
   // Fetch Books Library & Saved Sessions on mount
   useEffect(() => {
-    fetch("/api/books")
-      .then((r) => r.json())
-      .then((d) => {
-        if (Array.isArray(d.books)) {
-          setBooks(d.books);
-          const indexed = d.books.find((b: BookRecord) => b.analysisStatus === "indexed");
-          if (indexed) setSelectedBookId(indexed.id);
-        }
+    fetchBooks()
+      .then((bookList) => {
+        setBooks(bookList);
+        const indexed = bookList.find((b: BookRecord) => b.analysisStatus === "indexed");
+        if (indexed) setSelectedBookId(indexed.id);
       })
       .catch(() => {});
 
@@ -263,12 +270,9 @@ export const UnderstandingRadar: React.FC<UnderstandingRadarProps> = ({
 
   const fetchHistory = () => {
     setIsLoadingHistory(true);
-    fetch("/api/radar/sessions")
-      .then((r) => r.json())
-      .then((d) => {
-        if (Array.isArray(d.sessions)) {
-          setSavedSessions(d.sessions);
-        }
+    fetchRadarSessions()
+      .then((sessions) => {
+        setSavedSessions(sessions);
       })
       .catch(() => {})
       .finally(() => setIsLoadingHistory(false));
@@ -337,21 +341,13 @@ export const UnderstandingRadar: React.FC<UnderstandingRadarProps> = ({
     setSetupError(null);
     try {
       const fileBase64 = await readFileAsBase64(file);
-      const res = await fetch("/api/radar/extract-source", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileName: file.name,
-          mimeType: file.type || "application/octet-stream",
-          fileBase64,
-          subjectName: resolvedSubjectName,
-          gradeLevel,
-        }),
+      const data = await extractRadarSource({
+        fileName: file.name,
+        mimeType: file.type || "application/octet-stream",
+        fileBase64,
+        subjectName: resolvedSubjectName,
+        gradeLevel,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.message || "تعذر تحليل الملف المرفوع.");
-      }
       if (data.topicTitle && !lessonTopic.trim()) {
         setLessonTopic(data.topicTitle);
       }
@@ -409,11 +405,10 @@ export const UnderstandingRadar: React.FC<UnderstandingRadarProps> = ({
     }
 
     setIsGeneratingQuestions(true);
+    setQuestionPhase("connecting");
     try {
-      const res = await fetch("/api/radar/generate-questions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const data = await generateRadarQuestions(
+        {
           subjectName: resolvedSubjectName,
           gradeLevel,
           lessonTopic: lessonTopic.trim() || resolvedSubjectName,
@@ -422,12 +417,9 @@ export const UnderstandingRadar: React.FC<UnderstandingRadarProps> = ({
           questionTypes: selectedTypes,
           difficulty,
           language: uiLang,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.message || "تعذر توليد الأسئلة التشخيصية.");
-      }
+        },
+        { onPhaseChange: setQuestionPhase }
+      );
       setQuestions(Array.isArray(data.questions) ? data.questions : []);
       setQuestionsSource("ai");
     } catch (err) {
@@ -626,25 +618,17 @@ export const UnderstandingRadar: React.FC<UnderstandingRadarProps> = ({
         (m) => m.concept === concept
       );
 
-      const res = await fetch("/api/radar/intervene", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          subjectName: snapshot.subjectName,
-          gradeLevel: snapshot.gradeLevel,
-          lessonTopic: snapshot.lessonTopic,
-          concept,
-          currentAccuracyPct: cStat?.understandingPct ?? 0,
-          misconceptions: misconceptionsForConcept,
-          questionContext: qRelated || null,
-          wrongShortAnswers: qStat?.sampleWrongTextAnswers || [],
-          language: uiLang,
-        }),
+      const data = await requestRadarIntervention({
+        subjectName: snapshot.subjectName,
+        gradeLevel: snapshot.gradeLevel,
+        lessonTopic: snapshot.lessonTopic,
+        concept,
+        currentAccuracyPct: cStat?.understandingPct ?? 0,
+        misconceptions: misconceptionsForConcept,
+        questionContext: qRelated || null,
+        wrongShortAnswers: qStat?.sampleWrongTextAnswers || [],
+        language: uiLang,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.message || "تعذر توليد مقترحات التدخل.");
-      }
       setInterventionDraft({
         concept,
         diagnosisSummary: data.diagnosisSummary || "",
@@ -686,27 +670,19 @@ export const UnderstandingRadar: React.FC<UnderstandingRadarProps> = ({
     setIsTutorThinking(true);
 
     try {
-      const res = await fetch("/api/radar/tutor", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userRole: mode === "student" ? "student" : "teacher",
-          subjectName: snapshot?.subjectName || resolvedSubjectName,
-          gradeLevel: snapshot?.gradeLevel || gradeLevel,
-          lessonTopic: snapshot?.lessonTopic || lessonTopic,
-          lessonContent,
-          activeQuestion: snapshot?.currentQuestion || null,
-          sessionStatus: snapshot?.status || "lobby",
-          mode: tutorMode,
-          userMessage: query,
-          history: tutorMessages.slice(-6).map((m) => ({ sender: m.sender, text: m.text })),
-          language: uiLang,
-        }),
+      const data = await askRadarTutor({
+        userRole: mode === "student" ? "student" : "teacher",
+        subjectName: snapshot?.subjectName || resolvedSubjectName,
+        gradeLevel: snapshot?.gradeLevel || gradeLevel,
+        lessonTopic: snapshot?.lessonTopic || lessonTopic,
+        lessonContent,
+        activeQuestion: snapshot?.currentQuestion || null,
+        sessionStatus: snapshot?.status || "lobby",
+        mode: tutorMode,
+        userMessage: query,
+        history: tutorMessages.slice(-6).map((m) => ({ sender: m.sender, text: m.text })),
+        language: uiLang,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.message || "تعذر استجابة المعلم الذكي.");
-      }
       const replyText = String(data.reply || "");
       setTutorMessages((prev) => [
         ...prev,
@@ -1282,9 +1258,10 @@ export const UnderstandingRadar: React.FC<UnderstandingRadarProps> = ({
                 )}
                 <span>
                   {isGeneratingQuestions
-                    ? isAr
-                      ? "جارٍ بناء الأسئلة التشخيصية بالذكاء الاصطناعي..."
-                      : "Generating Diagnostic Questions..."
+                    ? getAiPhaseMessage(questionPhase, uiLang) ||
+                      (isAr
+                        ? "جارٍ بناء الأسئلة التشخيصية بالذكاء الاصطناعي..."
+                        : "Generating Diagnostic Questions...")
                     : isAr
                       ? "توليد أسئلة الفحص التشخيصي بالذكاء الاصطناعي"
                       : "Generate AI Diagnostic Questions"}

@@ -1,11 +1,12 @@
 import type { Express, Request, Response } from "express";
 import { WebSocketServer, WebSocket } from "ws";
-import { GoogleGenAI, Type } from "@google/genai";
+import { Type, type GoogleGenAI } from "@google/genai";
 import {
   saveRadarSession,
   listRadarSessions,
   deleteRadarSessionById,
 } from "./server-db.ts";
+import { callGeminiStructured } from "./server-gemini.ts";
 import type {
   RadarConceptStat,
   RadarInterventionImpact,
@@ -18,40 +19,6 @@ import type {
   RadarStudentAnswerRecord,
   RadarStudentProfile,
 } from "./src/types.ts";
-
-const CHAT_MODEL = "gemini-4-hydrogen";
-const FALLBACK_CHAT_MODEL = "gemini-3.1-flash-lite";
-
-async function generateRadarWithFallback(
-  ai: GoogleGenAI,
-  params: Omit<Parameters<GoogleGenAI["models"]["generateContent"]>[0], "model">
-) {
-  const modelsToTry = [CHAT_MODEL, FALLBACK_CHAT_MODEL];
-  let lastErr: unknown = null;
-  for (let i = 0; i < modelsToTry.length; i++) {
-    const model = modelsToTry[i];
-    try {
-      return await ai.models.generateContent({ ...params, model });
-    } catch (err) {
-      lastErr = err;
-      const raw = err instanceof Error ? err.message : String(err);
-      const lower = raw.toLowerCase();
-      console.error(`[Radar Gemini ${model}]`, raw.slice(0, 300));
-      const isTransientOrQuota =
-        lower.includes("429") ||
-        lower.includes("resource_exhausted") ||
-        lower.includes("503") ||
-        lower.includes("unavailable") ||
-        lower.includes("not_found") ||
-        lower.includes("404");
-      if (!isTransientOrQuota || i === modelsToTry.length - 1) {
-        throw err;
-      }
-      await new Promise((r) => setTimeout(r, 350));
-    }
-  }
-  throw lastErr;
-}
 
 type GetGeminiClientFn = () => GoogleGenAI | null;
 type FormatGeminiErrorFn = (err: unknown) => { status: number; message: string; code: string };
@@ -909,24 +876,28 @@ Extract:
         ? [{ inlineData: { mimeType, data: fileBase64 } }, { text: instruction }]
         : [{ text: `${instruction}\n\nFile text:\n${rawText.slice(0, 16000)}` }];
 
-      const response = await generateRadarWithFallback(ai, {
-        contents: { parts },
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              topicTitle: { type: Type.STRING },
-              extractedText: { type: Type.STRING },
-              keyConcepts: { type: Type.ARRAY, items: { type: Type.STRING } },
-              objectives: { type: Type.ARRAY, items: { type: Type.STRING } },
+      const parsed = await callGeminiStructured<Record<string, unknown>>(
+        ai,
+        {
+          contents: { parts },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                topicTitle: { type: Type.STRING },
+                extractedText: { type: Type.STRING },
+                keyConcepts: { type: Type.ARRAY, items: { type: Type.STRING } },
+                objectives: { type: Type.ARRAY, items: { type: Type.STRING } },
+              },
+              required: ["topicTitle", "extractedText", "keyConcepts", "objectives"],
             },
-            required: ["topicTitle", "extractedText", "keyConcepts", "objectives"],
           },
         },
-      });
+        { label: "Radar extract-source" }
+      );
 
-      return res.json(JSON.parse((response.text ?? "{}").trim()));
+      return res.json(parsed);
     } catch (err) {
       const formatted = formatGeminiError(err);
       return res.status(formatted.status).json({ error: formatted.code, message: formatted.message });
@@ -998,56 +969,61 @@ CRITICAL PEDAGOGICAL RULES:
    - "explanation": clear diagnostic explanation why the right answer works and why distractors reflect a misconception.
 ${langRule}`;
 
-      const response = await generateRadarWithFallback(ai, {
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              questions: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING },
-                    questionType: { type: Type.STRING },
-                    cognitiveLevel: { type: Type.STRING },
-                    difficulty: { type: Type.STRING },
-                    concept: { type: Type.STRING },
-                    objective: { type: Type.STRING },
-                    misconceptionTarget: { type: Type.STRING },
-                    question: { type: Type.STRING },
-                    options: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    correctIndex: { type: Type.INTEGER },
-                    acceptableAnswers: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    timeLimitSec: { type: Type.INTEGER },
-                    explanation: { type: Type.STRING },
-                    hint: { type: Type.STRING },
+      const parsed = await callGeminiStructured<{ questions?: Partial<RadarQuestion>[] }>(
+        ai,
+        {
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                questions: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      id: { type: Type.STRING },
+                      questionType: { type: Type.STRING },
+                      cognitiveLevel: { type: Type.STRING },
+                      difficulty: { type: Type.STRING },
+                      concept: { type: Type.STRING },
+                      objective: { type: Type.STRING },
+                      misconceptionTarget: { type: Type.STRING },
+                      question: { type: Type.STRING },
+                      options: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      correctIndex: { type: Type.INTEGER },
+                      acceptableAnswers: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      timeLimitSec: { type: Type.INTEGER },
+                      explanation: { type: Type.STRING },
+                      hint: { type: Type.STRING },
+                    },
+                    required: [
+                      "questionType",
+                      "cognitiveLevel",
+                      "difficulty",
+                      "concept",
+                      "objective",
+                      "misconceptionTarget",
+                      "question",
+                      "options",
+                      "correctIndex",
+                      "timeLimitSec",
+                      "explanation",
+                      "hint",
+                    ],
                   },
-                  required: [
-                    "questionType",
-                    "cognitiveLevel",
-                    "difficulty",
-                    "concept",
-                    "objective",
-                    "misconceptionTarget",
-                    "question",
-                    "options",
-                    "correctIndex",
-                    "timeLimitSec",
-                    "explanation",
-                    "hint",
-                  ],
                 },
               },
+              required: ["questions"],
             },
-            required: ["questions"],
           },
         },
-      });
-
-      const parsed = JSON.parse((response.text ?? "{}").trim());
+        {
+          label: "Radar generate-questions",
+          validate: (obj) => Array.isArray(obj.questions),
+        }
+      );
       const questions: RadarQuestion[] = (Array.isArray(parsed.questions) ? parsed.questions : []).map(
         (q: Partial<RadarQuestion>, idx: number) => ({
           id: `rq-${Date.now().toString(36)}-${idx + 1}`,
@@ -1106,6 +1082,13 @@ ${langRule}`;
         language = "ar",
       } = req.body ?? {};
 
+      if (!String(concept || "").trim() && !String(lessonTopic || "").trim()) {
+        return res.status(400).json({
+          error: "MISSING_RADAR_CONTEXT",
+          message: "يرجى تحديد المفهوم أو عنوان الدرس قبل طلب التدخل العلاجي.",
+        });
+      }
+
       const langRule =
         language === "en"
           ? "Respond strictly in clear pedagogical English."
@@ -1130,68 +1113,74 @@ Provide:
 3) verificationQuestion: 1 brand-new MCQ question (4 options) testing the EXACT SAME concept "${concept}" from a DIFFERENT angle so it checks genuine transfer rather than repeating the old wording. Include concept, question, options (4), correctIndex, timeLimitSec (45), hint, explanation, misconceptionTarget.
 ${langRule}`;
 
-      const response = await generateRadarWithFallback(ai, {
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              diagnosisSummary: { type: Type.STRING },
-              strategies: {
-                type: Type.ARRAY,
-                items: {
+      const parsed = await callGeminiStructured<{
+        diagnosisSummary?: string;
+        strategies?: RadarInterventionStrategy[];
+        verificationQuestion?: Record<string, unknown>;
+      }>(
+        ai,
+        {
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                diagnosisSummary: { type: Type.STRING },
+                strategies: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      id: { type: Type.STRING },
+                      strategyType: { type: Type.STRING },
+                      title: { type: Type.STRING },
+                      teacherScript: { type: Type.STRING },
+                      studentFacingExplanation: { type: Type.STRING },
+                      practicalExample: { type: Type.STRING },
+                      estimatedMinutes: { type: Type.INTEGER },
+                    },
+                    required: [
+                      "id",
+                      "strategyType",
+                      "title",
+                      "teacherScript",
+                      "studentFacingExplanation",
+                      "practicalExample",
+                      "estimatedMinutes",
+                    ],
+                  },
+                },
+                verificationQuestion: {
                   type: Type.OBJECT,
                   properties: {
-                    id: { type: Type.STRING },
-                    strategyType: { type: Type.STRING },
-                    title: { type: Type.STRING },
-                    teacherScript: { type: Type.STRING },
-                    studentFacingExplanation: { type: Type.STRING },
-                    practicalExample: { type: Type.STRING },
-                    estimatedMinutes: { type: Type.INTEGER },
+                    concept: { type: Type.STRING },
+                    question: { type: Type.STRING },
+                    options: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    correctIndex: { type: Type.INTEGER },
+                    timeLimitSec: { type: Type.INTEGER },
+                    explanation: { type: Type.STRING },
+                    hint: { type: Type.STRING },
+                    misconceptionTarget: { type: Type.STRING },
                   },
                   required: [
-                    "id",
-                    "strategyType",
-                    "title",
-                    "teacherScript",
-                    "studentFacingExplanation",
-                    "practicalExample",
-                    "estimatedMinutes",
+                    "concept",
+                    "question",
+                    "options",
+                    "correctIndex",
+                    "timeLimitSec",
+                    "explanation",
+                    "hint",
+                    "misconceptionTarget",
                   ],
                 },
               },
-              verificationQuestion: {
-                type: Type.OBJECT,
-                properties: {
-                  concept: { type: Type.STRING },
-                  question: { type: Type.STRING },
-                  options: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  correctIndex: { type: Type.INTEGER },
-                  timeLimitSec: { type: Type.INTEGER },
-                  explanation: { type: Type.STRING },
-                  hint: { type: Type.STRING },
-                  misconceptionTarget: { type: Type.STRING },
-                },
-                required: [
-                  "concept",
-                  "question",
-                  "options",
-                  "correctIndex",
-                  "timeLimitSec",
-                  "explanation",
-                  "hint",
-                  "misconceptionTarget",
-                ],
-              },
+              required: ["diagnosisSummary", "strategies", "verificationQuestion"],
             },
-            required: ["diagnosisSummary", "strategies", "verificationQuestion"],
           },
         },
-      });
-
-      const parsed = JSON.parse((response.text ?? "{}").trim());
+        { label: "Radar intervene" }
+      );
       const vq = parsed.verificationQuestion || {};
       return res.json({
         diagnosisSummary: String(parsed.diagnosisSummary || ""),
@@ -1244,6 +1233,13 @@ ${langRule}`;
         language = "ar",
       } = req.body ?? {};
 
+      if (!String(userMessage || "").trim() && !String(lessonTopic || "").trim()) {
+        return res.status(400).json({
+          error: "EMPTY_TUTOR_PROMPT",
+          message: "يرجى كتابة سؤالك أو تحديد عنوان الدرس.",
+        });
+      }
+
       const isQuestionLive = sessionStatus === "question" && userRole === "student";
       const spoilerGuard = isQuestionLive
         ? `CRITICAL EXAM INTEGRITY RULE: The live diagnostic question is currently ACTIVE for students. NEVER state or reveal the final answer letter/option directly! Instead, give a scaffolded conceptual hint, break down the scientific principle step-by-step, or clarify definitions so the student discovers the answer themselves.`
@@ -1286,25 +1282,29 @@ ${activeQuestion ? `\nCurrent Question Context (concept: ${activeQuestion.concep
         },
       ];
 
-      const response = await generateRadarWithFallback(ai, {
-        contents,
-        config: {
-          systemInstruction,
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              reply: { type: Type.STRING },
-              simplifiedAnalogy: { type: Type.STRING },
-              scaffoldedHint: { type: Type.STRING },
-              followUpPrompts: { type: Type.ARRAY, items: { type: Type.STRING } },
+      const parsed = await callGeminiStructured<Record<string, unknown>>(
+        ai,
+        {
+          contents,
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                reply: { type: Type.STRING },
+                simplifiedAnalogy: { type: Type.STRING },
+                scaffoldedHint: { type: Type.STRING },
+                followUpPrompts: { type: Type.ARRAY, items: { type: Type.STRING } },
+              },
+              required: ["reply", "simplifiedAnalogy", "scaffoldedHint", "followUpPrompts"],
             },
-            required: ["reply", "simplifiedAnalogy", "scaffoldedHint", "followUpPrompts"],
           },
         },
-      });
+        { label: "Radar tutor" }
+      );
 
-      return res.json(JSON.parse((response.text ?? "{}").trim()));
+      return res.json(parsed);
     } catch (err) {
       const formatted = formatGeminiError(err);
       return res.status(formatted.status).json({ error: formatted.code, message: formatted.message });

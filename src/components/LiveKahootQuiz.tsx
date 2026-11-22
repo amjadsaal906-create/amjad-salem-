@@ -22,6 +22,12 @@ import type {
   QuizSessionReport,
   UILanguage,
 } from "../types.ts";
+import {
+  fetchLessonArtifacts,
+  fetchQuizReports,
+  generateQuiz,
+  saveLessonArtifact,
+} from "../utils/aiApi.ts";
 
 interface LiveKahootQuizProps {
   lesson: LessonData;
@@ -107,14 +113,11 @@ export const LiveKahootQuiz: React.FC<LiveKahootQuizProps> = ({ lesson, uiLang, 
 
   // Load saved quiz artifact for current lesson
   useEffect(() => {
-    fetch(`/api/artifacts?lessonId=${encodeURIComponent(lesson.id)}`)
-      .then((r) => r.json())
-      .then((d) => {
-        const found = (d.artifacts || []).find(
-          (a: { artifactType: string }) => a.artifactType === "kahoot_quiz"
-        );
+    fetchLessonArtifacts(lesson.id)
+      .then((artifacts) => {
+        const found = artifacts.find((a) => a.artifactType === "kahoot_quiz");
         if (found?.data) {
-          setQuiz(found.data);
+          setQuiz(found.data as KahootQuizData);
         } else {
           setQuiz({
             quizTitle: isAr ? `مسابقة ${lesson.title}` : `${lesson.title} Live Quiz`,
@@ -136,9 +139,8 @@ export const LiveKahootQuiz: React.FC<LiveKahootQuizProps> = ({ lesson, uiLang, 
   }, [lesson, isAr]);
 
   const loadReports = () => {
-    fetch("/api/quiz-reports")
-      .then((r) => r.json())
-      .then((d) => setReports(d.reports || []))
+    fetchQuizReports()
+      .then((r) => setReports(r))
       .catch(() => {});
   };
 
@@ -214,29 +216,26 @@ export const LiveKahootQuiz: React.FC<LiveKahootQuizProps> = ({ lesson, uiLang, 
     setGenerating(true);
     setGenError(null);
     try {
-      const res = await fetch("/api/generate/kahoot-quiz", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lesson, questionCount: 6, language: uiLang }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setGenError(data.message || "Error generating quiz.");
-      } else if (data.quiz) {
+      const data = await generateQuiz({ lesson, questionCount: 6, language: uiLang });
+      if (!data.quiz) {
+        setGenError(data.message || (isAr ? "تعذر توليد الاختبار التنافسي." : "Error generating quiz."));
+      } else {
         setQuiz(data.quiz);
-        await fetch("/api/artifacts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            lessonId: lesson.id,
-            artifactType: "kahoot_quiz",
-            title: data.quiz.quizTitle,
-            data: data.quiz,
-          }),
-        });
+        saveLessonArtifact({
+          lessonId: lesson.id,
+          artifactType: "kahoot_quiz",
+          title: data.quiz.quizTitle,
+          data: data.quiz,
+        }).catch(() => {});
       }
-    } catch {
-      setGenError(isAr ? "تعذر توليد الاختبار التنافسي." : "Could not generate competitive quiz.");
+    } catch (err) {
+      setGenError(
+        err instanceof Error
+          ? err.message
+          : isAr
+            ? "تعذر توليد الاختبار التنافسي."
+            : "Could not generate competitive quiz."
+      );
     } finally {
       setGenerating(false);
     }

@@ -18,6 +18,11 @@ import type {
   UILanguage,
 } from "../types.ts";
 import { blobToBase64 } from "../utils/speech.ts";
+import {
+  deletePrepTemplate,
+  extractPrepTemplate,
+  updatePrepTemplate,
+} from "../utils/aiApi.ts";
 
 interface PreparationFormCardProps {
   uiLang: UILanguage;
@@ -92,20 +97,15 @@ export const PreparationFormCard: React.FC<PreparationFormCardProps> = ({
 
     try {
       const fileBase64 = await blobToBase64(file);
-      const res = await fetch("/api/prep-templates/extract", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileName: file.name,
-          mimeType: file.type || "application/octet-stream",
-          fileBase64,
-          subjectScope: newSubjectScope,
-          templateName: newTemplateName,
-          customInstructions: newCustomInstructions,
-        }),
+      const data = await extractPrepTemplate({
+        fileName: file.name,
+        mimeType: file.type || "application/octet-stream",
+        fileBase64,
+        subjectScope: newSubjectScope,
+        templateName: newTemplateName,
+        customInstructions: newCustomInstructions,
       });
-      const data = await res.json();
-      if (!res.ok || !data.template) {
+      if (!data.template) {
         throw new Error(
           data.message ||
             (isAr ? "تعذر تحليل وحفظ فورمة التحضير." : "Failed to extract and save template.")
@@ -155,16 +155,8 @@ export const PreparationFormCard: React.FC<PreparationFormCardProps> = ({
         presentationMappingGuidelines: editPptRules.trim(),
         customInstructions: editNotes.trim(),
       };
-      const res = await fetch(
-        `/api/prep-templates/${encodeURIComponent(activePrepTemplate.id)}`,
-        {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(updatedBody),
-        }
-      );
-      const data = await res.json();
-      if (!res.ok || !data.template) {
+      const data = await updatePrepTemplate(activePrepTemplate.id, updatedBody);
+      if (!data.template) {
         throw new Error(data.message || "Failed to update template.");
       }
       onTemplateSaved(data.template as PreparationTemplate);
@@ -188,12 +180,8 @@ export const PreparationFormCard: React.FC<PreparationFormCardProps> = ({
 
   const handleDeleteTemplate = async (templateId: string) => {
     try {
-      const res = await fetch(`/api/prep-templates/${encodeURIComponent(templateId)}`, {
-        method: "DELETE",
-      });
-      if (res.ok) {
-        onTemplateDeleted(templateId);
-      }
+      await deletePrepTemplate(templateId);
+      onTemplateDeleted(templateId);
     } catch {
       // Ignore
     }

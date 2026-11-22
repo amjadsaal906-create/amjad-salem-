@@ -1,3 +1,5 @@
+import { safeFetchJson } from "./apiClient.ts";
+
 let activeAudio: HTMLAudioElement | null = null;
 
 export function detectTextLanguage(text: string): "ar" | "en" {
@@ -63,20 +65,22 @@ export async function speakWithGeminiTTS(
   const resolvedLang = lang === "auto" ? detectTextLanguage(text) : lang;
 
   try {
-    const res = await fetch("/api/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text,
-        style:
-          resolvedLang === "en"
-            ? "Clear, warm English educational narrator"
-            : "Clear, warm Arabic educational narrator",
-      }),
-    });
+    const { data } = await safeFetchJson<{ audioBase64?: string; mimeType?: string; message?: string }>(
+      "/api/tts",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text,
+          style:
+            resolvedLang === "en"
+              ? "Clear, warm English educational narrator"
+              : "Clear, warm Arabic educational narrator",
+        }),
+      }
+    );
 
-    const data = await res.json();
-    if (!res.ok || !data.audioBase64) {
+    if (!data.audioBase64) {
       return {
         ok: false,
         error: data.message || "تعذر توليد الصوت عبر خدمة الذكاء الاصطناعي.",

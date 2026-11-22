@@ -14,6 +14,9 @@ import {
   AlertTriangle,
   FileCheck2,
   Layers,
+  Upload,
+  Paperclip,
+  X,
 } from "lucide-react";
 import type {
   AccessibilitySettings,
@@ -29,6 +32,7 @@ import type {
 import {
   assembleVideoWebm,
   exportLessonPlanDocx,
+  exportPresentationPptx,
   exportWorksheetDocx,
   printHtmlAsPdf,
 } from "../utils/exporters.ts";
@@ -39,6 +43,23 @@ import {
   buildDemoVideoProject,
   buildDemoWorksheet,
 } from "../utils/demoSamples.ts";
+import {
+  ApiResponseError,
+  getAiPhaseMessage,
+  type AiRequestPhase,
+} from "../utils/apiClient.ts";
+import {
+  exportPowerPointFile,
+  fetchLessonArtifacts,
+  generateAutoPowerPointFile,
+  generateLessonPlan,
+  generatePowerPointDeck,
+  generateVeoVideo,
+  generateVideoScript,
+  generateWorksheet,
+  saveLessonArtifact,
+} from "../utils/aiApi.ts";
+import { inferUploadMimeType, prepareUploadPayload } from "../utils/chunkUpload.ts";
 
 export type StudioSubTab = "lesson_plan" | "pptx" | "video" | "worksheet";
 
@@ -74,6 +95,7 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
   const isAr = uiLang === "ar";
   const [contentSource, setContentSource] = useState<"ai" | "demo" | null>(null);
   const [loading, setLoading] = useState(false);
+  const [requestPhase, setRequestPhase] = useState<AiRequestPhase>("idle");
   const [autoGeneratingPptx, setAutoGeneratingPptx] = useState(false);
   const [pptxAutoStatus, setPptxAutoStatus] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -95,6 +117,16 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
   const [veoLoading, setVeoLoading] = useState(false);
   const [previewSceneIdx, setPreviewSceneIdx] = useState(0);
 
+  // Lesson Plan Teacher Inputs & Attached Sources
+  const [planCustomTopic, setPlanCustomTopic] = useState("");
+  const [planDurationMinutes, setPlanDurationMinutes] = useState<number>(lesson.estimatedMinutes || 45);
+  const [planTargetGroup, setPlanTargetGroup] = useState("");
+  const [planFocusObjectives, setPlanFocusObjectives] = useState("");
+  const [planExtraInstructions, setPlanExtraInstructions] = useState("");
+  const [planAttachedNotes, setPlanAttachedNotes] = useState("");
+  const [planAttachedFiles, setPlanAttachedFiles] = useState<File[]>([]);
+  const [planInputsOpen, setPlanInputsOpen] = useState(true);
+
   const [worksheet, setWorksheet] = useState<WorksheetData | null>(null);
   const [worksheetViewMode, setWorksheetViewMode] = useState<"student" | "teacher">("student");
 
@@ -108,16 +140,15 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
     setWorksheet(null);
     setAssembledVideoUrl(null);
     setVeoStatusMsg(null);
+    setPlanDurationMinutes(lesson.estimatedMinutes || 45);
 
-    fetch(`/api/artifacts?lessonId=${encodeURIComponent(lesson.id)}`)
-      .then((r) => r.json())
-      .then((d) => {
-        const list = d.artifacts || [];
+    fetchLessonArtifacts(lesson.id)
+      .then((list) => {
         for (const item of list) {
-          if (item.artifactType === "lesson_plan") setLessonPlan(item.data);
-          if (item.artifactType === "presentation") setDeck(item.data);
-          if (item.artifactType === "video_project") setVideoProject(item.data);
-          if (item.artifactType === "worksheet") setWorksheet(item.data);
+          if (item.artifactType === "lesson_plan") setLessonPlan(item.data as LessonPlanData);
+          if (item.artifactType === "presentation") setDeck(item.data as PresentationDeckData);
+          if (item.artifactType === "video_project") setVideoProject(item.data as VideoProjectData);
+          if (item.artifactType === "worksheet") setWorksheet(item.data as WorksheetData);
         }
       })
       .catch(() => {});
@@ -128,13 +159,13 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
     title: string,
     data: unknown
   ) => {
-    await fetch("/api/artifacts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ lessonId: lesson.id, artifactType, title, data }),
-    });
-    setSaveNotice(isAr ? "تم الحفظ في قاعدة بيانات الدرس بنجاح." : "Saved to lesson database.");
-    setTimeout(() => setSaveNotice(null), 2500);
+    try {
+      await saveLessonArtifact({ lessonId: lesson.id, artifactType, title, data });
+      setSaveNotice(isAr ? "تم الحفظ في قاعدة بيانات الدرس بنجاح." : "Saved to lesson database.");
+      setTimeout(() => setSaveNotice(null), 2500);
+    } catch {
+      // Do not falsely report DB save success when backend isn't reachable
+    }
   };
 
   const guardConsent = () => {
@@ -173,38 +204,101 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
     }
   };
 
-  const handleGenerateLessonPlan = async () => {
-    if (demoMode) {
-      const sample = buildDemoLessonPlan(lesson, uiLang, activePrepTemplate?.templateName);
-      setLessonPlan(sample);
-      setContentSource("demo");
-      await persistArtifact("lesson_plan", sample.lessonTitle, sample);
-      return;
+  const handlePlanAttachmentChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+    const valid = files.filter((f) => f.size <= 75 * 1024 * 1024);
+    if (valid.length < files.length) {
+      setErrorMsg(
+        isAr
+          ? "بعض الملفات تتجاوز الحد الأقصى (75 ميجابايت) وتم تجاهلها."
+          : "Some files exceed the 75 MB limit and were skipped."
+      );
     }
+    setPlanAttachedFiles((prev) => [...prev, ...valid].slice(0, 4));
+    e.target.value = "";
+  };
+
+  const handleGenerateLessonPlan = async () => {
     if (!guardConsent()) return;
+    if (demoMode) {
+      onToggleDemoMode?.(false);
+    }
     setLoading(true);
     setErrorMsg(null);
+    setSaveNotice(null);
     try {
-      const res = await fetch("/api/generate/lesson-plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const preparedAttachments: Array<{
+        fileName: string;
+        mimeType: string;
+        fileBase64?: string;
+        uploadId?: string;
+      }> = [];
+
+      for (const file of planAttachedFiles) {
+        const prepared = await prepareUploadPayload(file);
+        preparedAttachments.push({
+          fileName: file.name,
+          mimeType: inferUploadMimeType(file),
+          ...prepared,
+        });
+      }
+
+      const data = await generateLessonPlan(
+        {
           lesson,
           language: uiLang,
           sourcePolicy,
           prepTemplateId: activePrepTemplate?.id || lesson.prepTemplateId || "",
           prepTemplate: activePrepTemplate,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) setErrorMsg(data.message);
-      else if (data.lessonPlan) {
-        setLessonPlan(data.lessonPlan);
-        setContentSource("ai");
-        await persistArtifact("lesson_plan", data.lessonPlan.lessonTitle, data.lessonPlan);
+          teacherInputs: {
+            customTopic: planCustomTopic.trim() || undefined,
+            durationMinutes: planDurationMinutes || lesson.estimatedMinutes || 45,
+            targetGroup: planTargetGroup.trim() || undefined,
+            focusObjectives: planFocusObjectives.trim() || undefined,
+            extraInstructions: planExtraInstructions.trim() || undefined,
+          },
+          attachedNotes: planAttachedNotes.trim() || undefined,
+          attachedFiles: preparedAttachments,
+        },
+        { onPhaseChange: setRequestPhase }
+      );
+
+      if (!data.lessonPlan) {
+        setErrorMsg(
+          data.message ||
+            (isAr ? "لم يُرجع الخادم بيانات تحضير صالحة." : "Server did not return a valid lesson plan.")
+        );
+        return;
       }
-    } catch {
-      setErrorMsg(isAr ? "تعذر توليد التحضير." : "Failed to generate lesson plan.");
+
+      const normalizedPlan: LessonPlanData = {
+        ...data.lessonPlan,
+        objectives: Array.isArray(data.lessonPlan.objectives) ? data.lessonPlan.objectives : [],
+        teachingStrategies: Array.isArray(data.lessonPlan.teachingStrategies)
+          ? data.lessonPlan.teachingStrategies
+          : [],
+        learningActivities: Array.isArray(data.lessonPlan.learningActivities)
+          ? data.lessonPlan.learningActivities
+          : [],
+        resourcesAndMedia: Array.isArray(data.lessonPlan.resourcesAndMedia)
+          ? data.lessonPlan.resourcesAndMedia
+          : [],
+        customFormFields: Array.isArray(data.lessonPlan.customFormFields)
+          ? data.lessonPlan.customFormFields
+          : [],
+      };
+
+      setLessonPlan(normalizedPlan);
+      setContentSource("ai");
+      await persistArtifact("lesson_plan", normalizedPlan.lessonTitle, normalizedPlan);
+    } catch (err) {
+      if (err instanceof ApiResponseError) {
+        setErrorMsg(err.message);
+      } else {
+        const msg = err instanceof Error ? err.message : "";
+        setErrorMsg(msg || (isAr ? "تعذر توليد التحضير عبر الذكاء الاصطناعي." : "Failed to generate lesson plan."));
+      }
     } finally {
       setLoading(false);
     }
@@ -235,49 +329,137 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
     triggerBlobDownload(blob, fileName);
   };
 
+  const buildDeckFromEditedPlan = (): PresentationDeckData | null => {
+    if (!lessonPlan) return null;
+    const slides: PresentationDeckData["slides"] = [
+      {
+        slideNumber: 1,
+        slideType: "title",
+        title: lessonPlan.lessonTitle || lesson.title,
+        subtitle: `${lessonPlan.subject || lesson.subject} · ${lessonPlan.gradeLevel || lesson.gradeLevel}${
+          lessonPlan.templateNameUsed ? ` · ${lessonPlan.templateNameUsed}` : ""
+        }`,
+        bullets: [],
+        speakerNotes: lesson.summary || lessonPlan.lessonTitle,
+      },
+    ];
+    if (lessonPlan.warmUp) {
+      slides.push({
+        slideNumber: slides.length + 1,
+        slideType: "concept",
+        title: isAr ? "المقدمة والتمهيد" : "Introduction & Warm-up",
+        bullets: [lessonPlan.warmUp],
+        speakerNotes: lessonPlan.warmUp,
+      });
+    }
+    if (lessonPlan.objectives?.length) {
+      slides.push({
+        slideNumber: slides.length + 1,
+        slideType: "objectives",
+        title: isAr ? "الأهداف التعليمية" : "Learning Objectives",
+        bullets: lessonPlan.objectives.slice(0, 6),
+        speakerNotes: lessonPlan.objectives.join(" · "),
+      });
+    }
+    if (Array.isArray(lessonPlan.customFormFields) && lessonPlan.customFormFields.length > 0) {
+      for (const field of lessonPlan.customFormFields) {
+        if (!field.content?.trim()) continue;
+        slides.push({
+          slideNumber: slides.length + 1,
+          slideType: "concept",
+          title: field.sectionName,
+          bullets: field.content.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(0, 5),
+          speakerNotes: field.content,
+        });
+      }
+    } else if (lessonPlan.learningActivities?.length) {
+      slides.push({
+        slideNumber: slides.length + 1,
+        slideType: "example",
+        title: isAr ? "الأنشطة والتطبيقات" : "Activities & Practice",
+        bullets: lessonPlan.learningActivities.slice(0, 6),
+        speakerNotes: (lessonPlan.teachingStrategies || []).join(" · "),
+      });
+    }
+    if (lessonPlan.assessment) {
+      slides.push({
+        slideNumber: slides.length + 1,
+        slideType: "example",
+        title: isAr ? "التقويم" : "Assessment",
+        bullets: [lessonPlan.assessment],
+        speakerNotes: lessonPlan.assessment,
+      });
+    }
+    slides.push({
+      slideNumber: slides.length + 1,
+      slideType: "summary",
+      title: isAr ? "الخاتمة والملخص والواجب" : "Conclusion & Homework",
+      bullets: [
+        ...(lessonPlan.homework ? [lessonPlan.homework] : []),
+        ...(lessonPlan.differentiationAndInclusion ? [lessonPlan.differentiationAndInclusion] : []),
+      ],
+      speakerNotes: [lessonPlan.homework, lessonPlan.differentiationAndInclusion].filter(Boolean).join(" · "),
+    });
+    return {
+      deckTitle: lessonPlan.lessonTitle || lesson.title,
+      subject: lessonPlan.subject || lesson.subject,
+      gradeLevel: lessonPlan.gradeLevel || lesson.gradeLevel,
+      themeAccent: "#0F766E",
+      templateNameUsed: lessonPlan.templateNameUsed,
+      slides,
+    };
+  };
+
   const handleServerExportPptx = async (overrideDeck?: PresentationDeckData | null) => {
     setLoading(true);
     setErrorMsg(null);
     setPptxAutoStatus(
       isAr
-        ? "جارٍ تنسيق الشرائح وتجهيز ملف .pptx على الخادم..."
-        : "Formatting slides & packaging .pptx on server..."
+        ? "جارٍ تنسيق الشرائح وتجهيز ملف PowerPoint (.pptx)..."
+        : "Formatting slides & packaging .pptx..."
     );
+    const candidateDeck = (overrideDeck !== undefined ? overrideDeck : deck) || buildDeckFromEditedPlan();
     try {
-      const res = await fetch("/api/presentation/export-pptx", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          deck: overrideDeck !== undefined ? overrideDeck : deck,
-          lesson,
-          prepTemplateId: activePrepTemplate?.id || lesson.prepTemplateId || "",
-          prepTemplate: activePrepTemplate,
-          lessonPlan,
-          diagramUrl: lesson.diagramUrl,
-          language: uiLang,
-        }),
+      const { blob, fileNameHeader } = await exportPowerPointFile({
+        deck: overrideDeck !== undefined ? overrideDeck : deck,
+        lesson,
+        prepTemplateId: activePrepTemplate?.id || lesson.prepTemplateId || "",
+        prepTemplate: activePrepTemplate,
+        lessonPlan,
+        diagramUrl: lesson.diagramUrl,
+        language: uiLang,
       });
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        setErrorMsg(
-          errData.message ||
-            (isAr ? "تعذر تنسيق ملف PowerPoint على الخادم." : "Server .pptx export failed.")
-        );
-        return;
-      }
-      const blob = await res.blob();
-      const headerName = res.headers.get("X-File-Name");
-      const fallbackName = `${(deck?.deckTitle || lesson.title || "presentation").replace(/\s+/g, "_")}.pptx`;
-      const resolvedFileName = headerName ? decodeURIComponent(headerName) : fallbackName;
+      const fallbackName = `${(deck?.deckTitle || lesson.title || "presentation").replace(/[\\/:*?"<>|\s]+/g, "_")}.pptx`;
+      const resolvedFileName = fileNameHeader ? decodeURIComponent(fileNameHeader) : fallbackName;
       triggerBlobDownload(blob, resolvedFileName);
       setSaveNotice(
         isAr
-          ? `تم تنسيق وتنزيل ملف PowerPoint (${resolvedFileName}) عبر الخادم.`
-          : `Downloaded server-formatted PowerPoint (${resolvedFileName}).`
+          ? `تم تنسيق وتنزيل ملف PowerPoint (${resolvedFileName}) بنجاح.`
+          : `Downloaded PowerPoint (${resolvedFileName}).`
       );
       setTimeout(() => setSaveNotice(null), 3500);
-    } catch {
-      setErrorMsg(isAr ? "تعذر تنزيل ملف PowerPoint." : "Failed to download .pptx.");
+    } catch (err) {
+      if (
+        candidateDeck &&
+        err instanceof ApiResponseError &&
+        (err.status === 404 || err.status === 501 || err.code === "ROUTE_NOT_FOUND")
+      ) {
+        await exportPresentationPptx(candidateDeck, lesson.diagramUrl, uiLang);
+        setSaveNotice(
+          isAr
+            ? `تم تصدير وتنزيل ملف PowerPoint (.pptx) بنجاح.`
+            : `Exported and downloaded .pptx successfully.`
+        );
+        setTimeout(() => setSaveNotice(null), 3500);
+        return;
+      }
+      setErrorMsg(
+        err instanceof Error
+          ? err.message
+          : isAr
+            ? "تعذر تنزيل ملف PowerPoint."
+            : "Failed to download .pptx."
+      );
     } finally {
       setLoading(false);
       setPptxAutoStatus(null);
@@ -286,57 +468,92 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
 
   const handleAutoGenerateAndDownloadPptx = async () => {
     if (!guardConsent()) return;
+    if (demoMode) onToggleDemoMode?.(false);
     setAutoGeneratingPptx(true);
     setErrorMsg(null);
     setPptxAutoStatus(
       activePrepTemplate
         ? isAr
-          ? `جارٍ توليد وتنسيق ملف PowerPoint (.pptx) وفق قالب «${activePrepTemplate.templateName}» على الخادم...`
-          : `Auto-generating & formatting .pptx from "${activePrepTemplate.templateName}" on server...`
+          ? `جارٍ توليد وتنسيق ملف PowerPoint (.pptx) وفق قالب «${activePrepTemplate.templateName}»...`
+          : `Auto-generating & formatting .pptx from "${activePrepTemplate.templateName}"...`
         : isAr
-          ? "جارٍ توليد وتنسيق ملف PowerPoint (.pptx) على الخادم..."
-          : "Auto-generating & formatting .pptx on server..."
+          ? "جارٍ توليد وتنسيق ملف PowerPoint (.pptx) بالذكاء الاصطناعي..."
+          : "Auto-generating & formatting .pptx with AI..."
     );
     try {
-      const res = await fetch("/api/presentation/auto-pptx", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      let generatedDeck: PresentationDeckData | undefined;
+      let pptxBase64: string | undefined;
+      let fileName: string | undefined;
+      let mimeType: string | undefined;
+
+      try {
+        const data = await generateAutoPowerPointFile({
           lesson,
-          slideCount: 7,
+          slideCount: 8,
           language: uiLang,
           prepTemplateId: activePrepTemplate?.id || lesson.prepTemplateId || "",
           prepTemplate: activePrepTemplate,
           lessonPlan,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
+        });
+        generatedDeck = data.deck;
+        pptxBase64 = data.pptxBase64;
+        fileName = data.fileName;
+        mimeType = data.mimeType;
+      } catch (autoErr) {
+        if (
+          autoErr instanceof ApiResponseError &&
+          (autoErr.status === 404 || autoErr.status === 501 || autoErr.code === "ROUTE_NOT_FOUND")
+        ) {
+          const deckRes = await generatePowerPointDeck({
+            lesson,
+            slideCount: 8,
+            language: uiLang,
+            prepTemplateId: activePrepTemplate?.id || lesson.prepTemplateId || "",
+            prepTemplate: activePrepTemplate,
+            lessonPlan,
+          });
+          generatedDeck = deckRes.deck;
+        } else {
+          throw autoErr;
+        }
+      }
+
+      if (!generatedDeck || !Array.isArray(generatedDeck.slides) || generatedDeck.slides.length === 0) {
         setErrorMsg(
-          data.message ||
-            (isAr ? "تعذر توليد ملف PowerPoint التلقائي." : "Auto-generate .pptx failed.")
+          isAr
+            ? "لم يُرجع الخادم شرائح صالحة لبناء ملف PowerPoint."
+            : "Server did not return valid slides to build .pptx."
         );
         return;
       }
-      if (data.deck) {
-        setDeck(data.deck);
-        setActiveSlideIdx(0);
+
+      setDeck(generatedDeck);
+      setActiveSlideIdx(0);
+      setContentSource("ai");
+      await persistArtifact("presentation", generatedDeck.deckTitle, generatedDeck);
+
+      if (pptxBase64 && fileName) {
+        triggerBase64PptxDownload(pptxBase64, fileName, mimeType);
+      } else {
+        await exportPresentationPptx(generatedDeck, lesson.diagramUrl, uiLang);
       }
-      if (data.pptxBase64 && data.fileName) {
-        triggerBase64PptxDownload(data.pptxBase64, data.fileName, data.mimeType);
-      }
+
       if (activeSubTab !== "pptx") {
         onSubTabChange("pptx");
       }
       setSaveNotice(
         isAr
-          ? `تم توليد وحفظ وتنزيل ملف PowerPoint (${data.fileName || "deck.pptx"}) وفق القالب المختار.`
-          : `Generated, saved, and downloaded "${data.fileName || "deck.pptx"}" from selected template.`
+          ? `تم توليد وحفظ وتنزيل ملف PowerPoint (${fileName || generatedDeck.deckTitle + ".pptx"}) بنجاح.`
+          : `Generated, saved, and downloaded "${fileName || generatedDeck.deckTitle + ".pptx"}".`
       );
       setTimeout(() => setSaveNotice(null), 4000);
-    } catch {
+    } catch (err) {
       setErrorMsg(
-        isAr ? "تعذر الاتصال بالخادم لتوليد العرض التقديمي." : "Server connection failed during .pptx generation."
+        err instanceof Error
+          ? err.message
+          : isAr
+            ? "تعذر الاتصال بالخادم لتوليد العرض التقديمي."
+            : "Server connection failed during .pptx generation."
       );
     } finally {
       setAutoGeneratingPptx(false);
@@ -345,40 +562,41 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
   };
 
   const handleGeneratePresentation = async () => {
-    if (demoMode) {
-      const sampleDeck = buildDemoPresentationDeck(lesson, uiLang, activePrepTemplate?.templateName);
-      setDeck(sampleDeck);
-      setActiveSlideIdx(0);
-      setContentSource("demo");
-      await persistArtifact("presentation", sampleDeck.deckTitle, sampleDeck);
-      return;
-    }
     if (!guardConsent()) return;
+    if (demoMode) onToggleDemoMode?.(false);
     setLoading(true);
     setErrorMsg(null);
     try {
-      const res = await fetch("/api/generate/presentation", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const data = await generatePowerPointDeck(
+        {
           lesson,
           slideCount: 7,
           language: uiLang,
           prepTemplateId: activePrepTemplate?.id || lesson.prepTemplateId || "",
           prepTemplate: activePrepTemplate,
           lessonPlan,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) setErrorMsg(data.message);
-      else if (data.deck) {
-        setDeck(data.deck);
-        setActiveSlideIdx(0);
-        setContentSource("ai");
-        await persistArtifact("presentation", data.deck.deckTitle, data.deck);
+        },
+        { onPhaseChange: setRequestPhase }
+      );
+      if (!data.deck) {
+        setErrorMsg(
+          data.message ||
+            (isAr ? "لم يُرجع الخادم شرائح PowerPoint صالحة." : "Server did not return a valid PowerPoint deck.")
+        );
+        return;
       }
-    } catch {
-      setErrorMsg(isAr ? "تعذر توليد العرض التقديمي." : "Failed to generate PowerPoint deck.");
+      setDeck(data.deck);
+      setActiveSlideIdx(0);
+      setContentSource("ai");
+      await persistArtifact("presentation", data.deck.deckTitle, data.deck);
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error
+          ? err.message
+          : isAr
+            ? "تعذر توليد العرض التقديمي."
+            : "Failed to generate PowerPoint deck."
+      );
     } finally {
       setLoading(false);
     }
@@ -386,69 +604,48 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
 
   const handleGeneratePlanAndDeckTogether = async () => {
     if (!guardConsent()) return;
+    if (demoMode) onToggleDemoMode?.(false);
     setLoading(true);
     setErrorMsg(null);
     try {
       const resolvedTplId = activePrepTemplate?.id || lesson.prepTemplateId || "";
-      const planRes = await fetch("/api/generate/lesson-plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          lesson,
-          language: uiLang,
-          sourcePolicy,
-          prepTemplateId: resolvedTplId,
-          prepTemplate: activePrepTemplate,
-        }),
+      const planData = await generateLessonPlan({
+        lesson,
+        language: uiLang,
+        sourcePolicy,
+        prepTemplateId: resolvedTplId,
+        prepTemplate: activePrepTemplate,
       });
-      const planData = await planRes.json();
-      if (!planRes.ok || !planData.lessonPlan) {
+      if (!planData.lessonPlan) {
         setErrorMsg(planData.message || (isAr ? "تعذر توليد التحضير." : "Failed to generate lesson plan."));
         return;
       }
 
       setLessonPlan(planData.lessonPlan);
-      await fetch("/api/artifacts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          lessonId: lesson.id,
-          artifactType: "lesson_plan",
-          title: planData.lessonPlan.lessonTitle,
-          data: planData.lessonPlan,
-        }),
-      });
+      await persistArtifact("lesson_plan", planData.lessonPlan.lessonTitle, planData.lessonPlan);
 
-      const pptxRes = await fetch("/api/generate/presentation", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          lesson,
-          slideCount: 7,
-          language: uiLang,
-          prepTemplateId: resolvedTplId,
-          prepTemplate: activePrepTemplate,
-          lessonPlan: planData.lessonPlan,
-        }),
+      const pptxData = await generatePowerPointDeck({
+        lesson,
+        slideCount: 7,
+        language: uiLang,
+        prepTemplateId: resolvedTplId,
+        prepTemplate: activePrepTemplate,
+        lessonPlan: planData.lessonPlan,
       });
-      const pptxData = await pptxRes.json();
-      if (!pptxRes.ok || !pptxData.deck) {
-        setErrorMsg(pptxData.message || (isAr ? "تم حفظ التحضير لكن تعذر توليد البوربوينت." : "Plan saved, but PowerPoint generation failed."));
+      if (!pptxData.deck) {
+        setErrorMsg(
+          pptxData.message ||
+            (isAr
+              ? "تم توليد التحضير لكن تعذر توليد البوربوينت."
+              : "Plan generated, but PowerPoint generation failed.")
+        );
         return;
       }
 
       setDeck(pptxData.deck);
       setActiveSlideIdx(0);
-      await fetch("/api/artifacts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          lessonId: lesson.id,
-          artifactType: "presentation",
-          title: pptxData.deck.deckTitle,
-          data: pptxData.deck,
-        }),
-      });
+      setContentSource("ai");
+      await persistArtifact("presentation", pptxData.deck.deckTitle, pptxData.deck);
 
       setSaveNotice(
         isAr
@@ -456,46 +653,47 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
           : "Lesson plan and PowerPoint deck built & saved from Preparation Form."
       );
       setTimeout(() => setSaveNotice(null), 4000);
-    } catch {
-      setErrorMsg(isAr ? "تعذر إتمام البناء المتكامل." : "Failed combined generation.");
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error
+          ? err.message
+          : isAr
+            ? "تعذر إتمام البناء المتكامل."
+            : "Failed combined generation."
+      );
     } finally {
       setLoading(false);
     }
   };
 
   const handleGenerateVideoScript = async () => {
-    if (demoMode) {
-      const sampleVid = buildDemoVideoProject(lesson, videoStyle, videoPersona, videoLang);
-      setVideoProject(sampleVid);
-      setPreviewSceneIdx(0);
-      setContentSource("demo");
-      await persistArtifact("video_project", sampleVid.videoTitle, sampleVid);
-      return;
-    }
     if (!guardConsent()) return;
+    if (demoMode) onToggleDemoMode?.(false);
     setLoading(true);
     setErrorMsg(null);
     try {
-      const res = await fetch("/api/generate/video-script", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          lesson,
-          style: videoStyle,
-          presenterPersona: videoPersona,
-          language: videoLang,
-        }),
+      const data = await generateVideoScript({
+        lesson,
+        style: videoStyle,
+        presenterPersona: videoPersona,
+        language: videoLang,
       });
-      const data = await res.json();
-      if (!res.ok) setErrorMsg(data.message);
-      else if (data.project) {
-        setVideoProject(data.project);
-        setPreviewSceneIdx(0);
-        setContentSource("ai");
-        await persistArtifact("video_project", data.project.videoTitle, data.project);
+      if (!data.project) {
+        setErrorMsg(data.message || (isAr ? "تعذر توليد سيناريو الفيديو." : "Failed to generate video script."));
+        return;
       }
-    } catch {
-      setErrorMsg(isAr ? "تعذر توليد سيناريو الفيديو." : "Failed to generate video script.");
+      setVideoProject(data.project);
+      setPreviewSceneIdx(0);
+      setContentSource("ai");
+      await persistArtifact("video_project", data.project.videoTitle, data.project);
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error
+          ? err.message
+          : isAr
+            ? "تعذر توليد سيناريو الفيديو."
+            : "Failed to generate video script."
+      );
     } finally {
       setLoading(false);
     }
@@ -525,53 +723,52 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
         .slice(0, 2)
         .map((s) => s.visualCue)
         .join(". ")}`;
-      const res = await fetch("/api/generate/veo-video", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setVeoStatusMsg(data.message || "Veo API requires paid tier.");
-      } else if (data.videoBase64) {
+      const data = await generateVeoVideo({ prompt });
+      if (data.videoBase64) {
         setAssembledVideoUrl(`data:${data.mimeType || "video/mp4"};base64,${data.videoBase64}`);
         setVeoStatusMsg(isAr ? "تم إنتاج الفيديو عبر Veo بنجاح." : "Veo video generated successfully.");
       } else if (data.videoUri) {
         setAssembledVideoUrl(data.videoUri);
+      } else {
+        setVeoStatusMsg(data.message || "Veo API requires paid tier.");
       }
-    } catch {
-      setVeoStatusMsg(isAr ? "تعذر الاتصال بخدمة Veo." : "Veo connection error.");
+    } catch (err) {
+      setVeoStatusMsg(
+        err instanceof Error ? err.message : isAr ? "تعذر الاتصال بخدمة Veo." : "Veo connection error."
+      );
     } finally {
       setVeoLoading(false);
     }
   };
 
   const handleGenerateWorksheet = async () => {
-    if (demoMode) {
-      const sampleWs = buildDemoWorksheet(lesson, uiLang);
-      setWorksheet(sampleWs);
-      setContentSource("demo");
-      await persistArtifact("worksheet", sampleWs.worksheetTitle, sampleWs);
-      return;
-    }
     if (!guardConsent()) return;
+    if (demoMode) onToggleDemoMode?.(false);
     setLoading(true);
     setErrorMsg(null);
     try {
-      const res = await fetch("/api/generate/worksheet", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lesson, language: uiLang }),
-      });
-      const data = await res.json();
-      if (!res.ok) setErrorMsg(data.message);
-      else if (data.worksheet) {
-        setWorksheet(data.worksheet);
-        setContentSource("ai");
-        await persistArtifact("worksheet", data.worksheet.worksheetTitle, data.worksheet);
+      const data = await generateWorksheet(
+        { lesson, language: uiLang },
+        { onPhaseChange: setRequestPhase }
+      );
+      if (!data.worksheet) {
+        setErrorMsg(
+          data.message ||
+            (isAr ? "لم يُرجع الخادم ورقة عمل صالحة." : "Server did not return a valid worksheet.")
+        );
+        return;
       }
-    } catch {
-      setErrorMsg(isAr ? "تعذر توليد ورقة العمل." : "Failed to generate worksheet.");
+      setWorksheet(data.worksheet);
+      setContentSource("ai");
+      await persistArtifact("worksheet", data.worksheet.worksheetTitle, data.worksheet);
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error
+          ? err.message
+          : isAr
+            ? "تعذر توليد ورقة العمل."
+            : "Failed to generate worksheet."
+      );
     } finally {
       setLoading(false);
     }
@@ -782,7 +979,7 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
         </section>
       )}
 
-      {pptxAutoStatus && (
+      {(pptxAutoStatus || (loading && requestPhase !== "idle" && requestPhase !== "success")) && (
         <div
           role="status"
           aria-live="polite"
@@ -794,7 +991,7 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
           }}
         >
           <Loader2 className="w-4 h-4 animate-spin shrink-0" style={{ color: "var(--accent-primary)" }} />
-          <span>{pptxAutoStatus}</span>
+          <span>{pptxAutoStatus || getAiPhaseMessage(requestPhase, uiLang)}</span>
         </div>
       )}
       {contentSource && (
@@ -849,8 +1046,25 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
           style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border-hairline)" }}
         >
           <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-4" style={{ borderColor: "var(--border-hairline)" }}>
-            <h2 className="text-lg font-bold">{isAr ? "منشئ تحضير الدرس الاحترافي" : "Professional Lesson Plan Builder"}</h2>
+            <div>
+              <h2 className="text-lg font-bold">{isAr ? "منشئ تحضير الدرس الذكي (Gemini AI)" : "Smart AI Lesson Plan Builder"}</h2>
+              <p className="text-xs mt-0.5" style={{ color: "var(--text-secondary)" }}>
+                {isAr
+                  ? `المصادر المفعّلة للدرس: ${lesson.sources.filter((s) => s.enabled !== false).length} · المرفقات الإضافية: ${planAttachedFiles.length}`
+                  : `Active lesson sources: ${lesson.sources.filter((s) => s.enabled !== false).length} · Attached files: ${planAttachedFiles.length}`}
+              </p>
+            </div>
             <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => setPlanInputsOpen((v) => !v)}
+                className="min-h-[40px] px-3 py-2 rounded-lg border text-xs font-semibold"
+                style={{ borderColor: "var(--border-hairline)", color: "var(--text-primary)" }}
+              >
+                {planInputsOpen
+                  ? isAr ? "إخفاء مدخلات ومرفقات التحضير" : "Hide Inputs & Files"
+                  : isAr ? "مدخلات ومرفقات التحضير" : "Inputs & Files"}
+              </button>
               <button
                 type="button"
                 onClick={handleGenerateLessonPlan}
@@ -859,7 +1073,11 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
                 style={{ backgroundColor: "var(--accent-primary)", color: "var(--accent-contrast)" }}
               >
                 {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-                <span>{isAr ? "توليد التحضير من الدرس" : "Generate Lesson Plan"}</span>
+                <span>
+                  {loading
+                    ? isAr ? "جارٍ التوليد الفعلي بالذكاء الاصطناعي..." : "Generating with AI..."
+                    : isAr ? "توليد التحضير بالذكاء الاصطناعي" : "Generate AI Lesson Plan"}
+                </span>
               </button>
               {lessonPlan && (
                 <>
@@ -895,11 +1113,144 @@ export const ContentStudio: React.FC<ContentStudioProps> = ({
             </div>
           </div>
 
+          {planInputsOpen && (
+            <div
+              className="p-4 rounded-xl border space-y-3"
+              style={{ backgroundColor: "var(--bg-subtle)", borderColor: "var(--border-hairline)" }}
+            >
+              <div className="text-xs font-bold" style={{ color: "var(--accent-primary)" }}>
+                {isAr
+                  ? "بيانات ومدخلات المعلم والمصادر المرفقة للتحضير:"
+                  : "Teacher Inputs & Attached Sources for Lesson Plan:"}
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+                <div>
+                  <label className="block font-semibold mb-1">
+                    {isAr ? "محور خاص أو عنوان فرعي (اختياري)" : "Custom Focus Topic (optional)"}
+                  </label>
+                  <input
+                    type="text"
+                    value={planCustomTopic}
+                    onChange={(e) => setPlanCustomTopic(e.target.value)}
+                    placeholder={lesson.title}
+                    className="w-full min-h-[38px] px-3 rounded-lg border"
+                    style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border-hairline)", color: "var(--text-primary)" }}
+                  />
+                </div>
+                <div>
+                  <label className="block font-semibold mb-1">
+                    {isAr ? "مدة الحصة (بالدقائق)" : "Duration (minutes)"}
+                  </label>
+                  <input
+                    type="number"
+                    min={10}
+                    max={180}
+                    value={planDurationMinutes}
+                    onChange={(e) => setPlanDurationMinutes(Math.max(10, Number(e.target.value) || 45))}
+                    className="w-full min-h-[38px] px-3 rounded-lg border font-mono-num"
+                    style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border-hairline)", color: "var(--text-primary)" }}
+                  />
+                </div>
+                <div>
+                  <label className="block font-semibold mb-1">
+                    {isAr ? "الفئة المستهدفة / الشعبة (اختياري)" : "Target Group / Class (optional)"}
+                  </label>
+                  <input
+                    type="text"
+                    value={planTargetGroup}
+                    onChange={(e) => setPlanTargetGroup(e.target.value)}
+                    placeholder={isAr ? "مثال: عاشر/2 — تعليم عام وموهوبون" : "e.g., Grade 10 Section B"}
+                    className="w-full min-h-[38px] px-3 rounded-lg border"
+                    style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border-hairline)", color: "var(--text-primary)" }}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                <div>
+                  <label className="block font-semibold mb-1">
+                    {isAr ? "أهداف أو مهارات تركّز عليها المعلمة (اختياري)" : "Teacher Focus Objectives (optional)"}
+                  </label>
+                  <textarea
+                    rows={2}
+                    value={planFocusObjectives}
+                    onChange={(e) => setPlanFocusObjectives(e.target.value)}
+                    placeholder={isAr ? "مثال: التركيز على حل مسائل التوازن الكيميائي والتعلم النشط..." : "Focus on problem-solving and active learning..."}
+                    className="w-full p-2.5 rounded-lg border"
+                    style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border-hairline)", color: "var(--text-primary)" }}
+                  />
+                </div>
+                <div>
+                  <label className="block font-semibold mb-1">
+                    {isAr ? "ملاحظات / استراتيجيات مطلوبة أو نص مصدر إضافي" : "Additional Notes / Source Excerpt"}
+                  </label>
+                  <textarea
+                    rows={2}
+                    value={planAttachedNotes || planExtraInstructions}
+                    onChange={(e) => {
+                      setPlanAttachedNotes(e.target.value);
+                      setPlanExtraInstructions(e.target.value);
+                    }}
+                    placeholder={isAr ? "الصق نصاً من الكتاب أو اكتب تعليمات خاصة بالتحضير..." : "Paste textbook notes or extra prep instructions..."}
+                    className="w-full p-2.5 rounded-lg border"
+                    style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border-hairline)", color: "var(--text-primary)" }}
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                <label
+                  className="min-h-[38px] px-3.5 py-2 rounded-lg border border-dashed text-xs font-semibold flex items-center gap-2 cursor-pointer hover:opacity-90"
+                  style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--accent-primary)", color: "var(--accent-primary)" }}
+                >
+                  <Upload className="w-4 h-4 shrink-0" />
+                  <span>
+                    {isAr
+                      ? "إرفاق ملفات أو مصادر إضافية للتحضير (PDF / Word / PPTX / صورة / TXT)"
+                      : "Attach Source Files (PDF, Word, PPTX, Image, TXT)"}
+                  </span>
+                  <input
+                    type="file"
+                    multiple
+                    accept=".pdf,.docx,.pptx,.txt,.md,.csv,image/*"
+                    onChange={handlePlanAttachmentChange}
+                    className="sr-only"
+                  />
+                </label>
+
+                {planAttachedFiles.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    {planAttachedFiles.map((file, idx) => (
+                      <span
+                        key={`${file.name}-${idx}`}
+                        className="px-2.5 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5"
+                        style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border-hairline)" }}
+                      >
+                        <Paperclip className="w-3.5 h-3.5" style={{ color: "var(--accent-primary)" }} />
+                        <span className="truncate max-w-[160px]">{file.name}</span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setPlanAttachedFiles((prev) => prev.filter((_, i) => i !== idx))
+                          }
+                          aria-label={isAr ? "إزالة الملف" : "Remove file"}
+                          className="text-red-600 hover:opacity-80"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {!lessonPlan ? (
             <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
               {isAr
-                ? "اضغط على «توليد التحضير من الدرس» لإنشاء خطة درس متكاملة قابلة للتعديل والتنزيل بصيغتي Word وPDF."
-                : "Click Generate Lesson Plan to create an editable plan exportable to Word (.docx) and PDF."}
+                ? "أدخل أي ملاحظات أو أرفق مصادر إضافية أعلاه ثم اضغط «توليد التحضير بالذكاء الاصطناعي» لإنشاء تحضير فعلي قابل للتعديل والتنزيل بصيغتي Word وPDF."
+                : "Enter optional inputs or attach source files above, then click Generate AI Lesson Plan to build a real editable plan."}
             </p>
           ) : (
             <div className="space-y-4 text-sm">

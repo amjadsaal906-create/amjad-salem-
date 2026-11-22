@@ -22,6 +22,7 @@ import type {
   UILanguage,
 } from "../types.ts";
 import { speakWithBrowser, speakWithGeminiTTS, stopAllSpeech } from "../utils/speech.ts";
+import { describeScienceImage, simplifyScienceText } from "../utils/aiApi.ts";
 
 interface ScienceSimulationProps {
   lesson: LessonData;
@@ -277,22 +278,13 @@ export const ScienceSimulation: React.FC<ScienceSimulationProps> = ({
     setVisionLoading(true);
     setVisionError(null);
     try {
-      const res = await fetch("/api/describe-image", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          imageUrl: lesson.diagramUrl,
-          lessonTitle: lesson.title,
-        }),
+      const data = await describeScienceImage({
+        imageUrl: lesson.diagramUrl,
+        lessonTitle: lesson.title,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setVisionError(data.message || "تعذر تحليل الرسم العلمي.");
-      } else {
-        setVisionResult(data);
-      }
-    } catch {
-      setVisionError("تعذر الاتصال بخدمة الوصف البصري.");
+      setVisionResult(data);
+    } catch (err) {
+      setVisionError(err instanceof Error ? err.message : "تعذر الاتصال بخدمة الوصف البصري.");
     } finally {
       setVisionLoading(false);
     }
@@ -311,23 +303,14 @@ export const ScienceSimulation: React.FC<ScienceSimulationProps> = ({
       .join("\n")}`;
 
     try {
-      const res = await fetch("/api/simplify", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: combinedText,
-          lessonTitle: lesson.title,
-        }),
+      const data = await simplifyScienceText({
+        text: combinedText,
+        lessonTitle: lesson.title,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setSimplifyError(data.message || "تعذر تبسيط المحتوى حالياً.");
-      } else {
-        setSimplifiedSteps(data.steps || []);
-        setActiveStepIdx(0);
-      }
-    } catch {
-      setSimplifyError("تعذر الاتصال بخدمة تبسيط المحتوى.");
+      setSimplifiedSteps(data.steps || []);
+      setActiveStepIdx(0);
+    } catch (err) {
+      setSimplifyError(err instanceof Error ? err.message : "تعذر الاتصال بخدمة تبسيط المحتوى.");
     } finally {
       setSimplifyLoading(false);
     }

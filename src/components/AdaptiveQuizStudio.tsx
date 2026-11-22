@@ -11,6 +11,8 @@ import {
 } from "lucide-react";
 import type { AccessibilitySettings, LessonData, QuizQuestion } from "../types.ts";
 import { speakWithBrowser } from "../utils/speech.ts";
+import { getAiPhaseMessage, type AiRequestPhase } from "../utils/apiClient.ts";
+import { generateAdaptiveQuizQuestion } from "../utils/aiApi.ts";
 
 interface AdaptiveQuizStudioProps {
   lesson: LessonData;
@@ -38,6 +40,7 @@ export const AdaptiveQuizStudio: React.FC<AdaptiveQuizStudioProps> = ({
   const [score, setScore] = useState(0);
   const [answeredIds, setAnsweredIds] = useState<Record<string, boolean>>({});
   const [generating, setGenerating] = useState(false);
+  const [requestPhase, setRequestPhase] = useState<AiRequestPhase>("idle");
   const [genError, setGenError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -101,28 +104,35 @@ export const AdaptiveQuizStudio: React.FC<AdaptiveQuizStudioProps> = ({
     setGenError(null);
 
     try {
-      const res = await fetch("/api/adaptive-quiz", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const answeredCount = Object.keys(answeredIds).length;
+      const accuracyPct = answeredCount > 0 ? Math.round((score / answeredCount) * 100) : 70;
+      const adaptiveDifficulty =
+        settings.simplifiedMode || accuracyPct < 55
+          ? "easy"
+          : accuracyPct >= 85 && answeredCount >= 2
+            ? "hard"
+            : "medium";
+      const data = await generateAdaptiveQuizQuestion(
+        {
           lessonTitle: lesson.title,
           sources: lesson.sources.filter((s) => s.enabled),
           weakConcepts,
           accommodations: settings.accommodations,
-          difficulty: settings.simplifiedMode ? "easy" : "medium",
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setGenError(data.message || "تعذر توليد سؤال تكيفي جديد.");
-      } else {
-        setQuestions((prev) => [...prev, data]);
-        setCurrentIndex(questions.length);
-        setSelectedOption(null);
-        setShowHint(false);
-      }
-    } catch {
-      setGenError("تعذر الاتصال بخدمة توليد الاختبارات.");
+          difficulty: adaptiveDifficulty,
+          studentLevel: settings.simplifiedMode ? "beginner" : accuracyPct >= 85 && answeredCount >= 2 ? "advanced" : "intermediate",
+          studentStats: { answered: answeredCount, correct: score },
+          language: "ar",
+        },
+        { onPhaseChange: setRequestPhase }
+      );
+      setQuestions((prev) => [...prev, data]);
+      setCurrentIndex(questions.length);
+      setSelectedOption(null);
+      setShowHint(false);
+    } catch (err) {
+      setGenError(
+        err instanceof Error ? err.message : "تعذر الاتصال بخدمة توليد الاختبارات."
+      );
     } finally {
       setGenerating(false);
     }
@@ -159,7 +169,11 @@ export const AdaptiveQuizStudio: React.FC<AdaptiveQuizStudioProps> = ({
               style={{ backgroundColor: "var(--accent-primary)", color: "var(--accent-contrast)" }}
             >
               {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-              <span>توليد سؤال تكيفي لمستواك</span>
+              <span>
+                {generating
+                  ? getAiPhaseMessage(requestPhase, "ar") || "جاري إنشاء السؤال التكيفي..."
+                  : "توليد سؤال تكيفي لمستواك"}
+              </span>
             </button>
           </div>
         </div>

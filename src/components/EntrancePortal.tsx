@@ -28,6 +28,7 @@ import {
   speakWithGeminiTTS,
   stopAllSpeech,
 } from "../utils/speech.ts";
+import { sendChatRequest } from "../utils/aiApi.ts";
 
 export type PortalDestination = "home" | "library" | "studio" | "radar" | "kahoot" | "chatbot" | "inclusive";
 
@@ -195,29 +196,18 @@ export const EntrancePortal: React.FC<EntrancePortalProps> = ({
     setSpeechNotice(null);
 
     try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          role: userRole,
-          messages: [{ sender: "user", text: query }],
-          lessonTitle: activeLesson.title,
-          lessonSummary: activeLesson.summary,
-          sources: activeLesson.sources,
-          sourcePolicy: "open_scientific",
-          actionMode: "explain",
-          studentLevel: "intermediate",
-          language: uiLang,
-          simplifiedMode: true,
-        }),
+      const data = await sendChatRequest({
+        role: userRole,
+        messages: [{ sender: "user", text: query }],
+        lessonTitle: activeLesson.title,
+        lessonSummary: activeLesson.summary,
+        sources: activeLesson.sources,
+        sourcePolicy: "open_scientific",
+        actionMode: "explain",
+        studentLevel: "intermediate",
+        language: uiLang,
+        simplifiedMode: true,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(
-          data.message ||
-            (isAr ? "تعذر الاتصال بالمساعد الصوتي حالياً." : "Unable to reach the voice assistant right now.")
-        );
-      }
 
       const replyText = String(data.reply || "").trim();
       if (replyText) {

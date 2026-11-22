@@ -7,6 +7,7 @@ import {
   Download,
   AlertTriangle,
   CheckCircle2,
+  Server,
 } from "lucide-react";
 import type {
   AccessibilitySettings,
@@ -16,6 +17,13 @@ import type {
   UILanguage,
   WeakSpot,
 } from "../types.ts";
+import {
+  DEFAULT_WORKER_API_BASE_URL,
+  getApiBaseUrl,
+  setApiBaseUrl,
+  ApiResponseError,
+} from "../utils/apiClient.ts";
+import { fetchCapabilities } from "../utils/aiApi.ts";
 
 interface TeacherAndPrivacyPanelProps {
   lesson: LessonData;
@@ -29,6 +37,7 @@ interface TeacherAndPrivacyPanelProps {
   onClearAllStudentData: () => void;
   onExportStudentData: () => void;
   capabilities: PlatformCapabilities | null;
+  onRefreshCapabilities?: () => void;
   uiLang?: UILanguage;
 }
 
@@ -44,6 +53,7 @@ export const TeacherAndPrivacyPanel: React.FC<TeacherAndPrivacyPanelProps> = ({
   onClearAllStudentData,
   onExportStudentData,
   capabilities,
+  onRefreshCapabilities,
   uiLang = "ar",
 }) => {
   const isAr = uiLang === "ar";
@@ -51,6 +61,40 @@ export const TeacherAndPrivacyPanel: React.FC<TeacherAndPrivacyPanelProps> = ({
   const [newCategory, setNewCategory] = useState("ملاحظات المعلم المضافة");
   const [newContent, setNewContent] = useState("");
   const [clearConfirm, setClearConfirm] = useState(false);
+  const [workerUrlInput, setWorkerUrlInput] = useState(() => getApiBaseUrl());
+  const [connectionStatus, setConnectionStatus] = useState<string | null>(null);
+  const [testingConnection, setTestingConnection] = useState(false);
+
+  const handleSaveAndTestWorkerUrl = async () => {
+    const cleaned = workerUrlInput.trim() || DEFAULT_WORKER_API_BASE_URL;
+    setWorkerUrlInput(cleaned);
+    setApiBaseUrl(cleaned);
+    setTestingConnection(true);
+    setConnectionStatus(null);
+    try {
+      const data = await fetchCapabilities();
+      onRefreshCapabilities?.();
+      setConnectionStatus(
+        data.geminiConfigured
+          ? isAr
+            ? "تم الاتصال بالخادم بنجاح ومحرك Gemini مهيأ."
+            : "Connected to backend and Gemini is configured."
+          : isAr
+            ? "تم الاتصال بالخادم لكن مفتاح GEMINI_API_KEY غير مهيأ على الخادم."
+            : "Connected to backend, but GEMINI_API_KEY is not configured."
+      );
+    } catch (err) {
+      setConnectionStatus(
+        err instanceof ApiResponseError
+          ? err.message
+          : isAr
+            ? "تعذر الاتصال بالخادم المحدد."
+            : "Could not reach the specified backend URL."
+      );
+    } finally {
+      setTestingConnection(false);
+    }
+  };
 
   const handleAddSource = (e: React.FormEvent) => {
     e.preventDefault();
@@ -323,6 +367,51 @@ export const TeacherAndPrivacyPanel: React.FC<TeacherAndPrivacyPanelProps> = ({
                   ? "غير مهيأة (تعمل عبر القاموس الإشاري المحلي فقط حالياً؛ تتطلب SIGN_LANGUAGE_API_URL و SIGN_LANGUAGE_API_KEY)"
                   : "Not configured (local glossary active; requires SIGN_LANGUAGE_API_URL & SIGN_LANGUAGE_API_KEY)"}
               </span>
+            </div>
+
+            <div className="pt-2 mt-2 border-t space-y-2" style={{ borderColor: "var(--border-hairline)" }}>
+              <div className="flex items-center gap-1.5 font-bold">
+                <Server className="w-3.5 h-3.5" style={{ color: "var(--accent-primary)" }} />
+                <span>
+                  {isAr
+                    ? "عنوان الخادم الموحد / Cloudflare Worker:"
+                    : "Unified Server / Cloudflare Worker URL:"}
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <input
+                  type="url"
+                  dir="ltr"
+                  value={workerUrlInput}
+                  onChange={(e) => setWorkerUrlInput(e.target.value)}
+                  placeholder={DEFAULT_WORKER_API_BASE_URL}
+                  className="flex-1 min-w-[220px] min-h-[38px] px-3 rounded-lg border text-xs"
+                  style={{
+                    backgroundColor: "var(--bg-surface)",
+                    borderColor: "var(--border-hairline)",
+                    color: "var(--text-primary)",
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => void handleSaveAndTestWorkerUrl()}
+                  disabled={testingConnection}
+                  className="min-h-[38px] px-3.5 py-1.5 rounded-lg text-xs font-bold"
+                  style={{
+                    backgroundColor: "var(--accent-primary)",
+                    color: "var(--accent-contrast)",
+                  }}
+                >
+                  {testingConnection
+                    ? isAr ? "جارٍ الفحص..." : "Testing..."
+                    : isAr ? "حفظ وفحص الاتصال" : "Save & Test"}
+                </button>
+              </div>
+              {connectionStatus && (
+                <p className="text-[11px] font-semibold" style={{ color: "var(--accent-primary)" }}>
+                  {connectionStatus}
+                </p>
+              )}
             </div>
           </div>
 

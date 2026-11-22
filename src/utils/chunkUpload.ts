@@ -1,4 +1,5 @@
 import { blobToBase64 } from "./speech.ts";
+import { resolveApiUrl, safeFetchJson, looksLikeHtmlResponse, ApiResponseError } from "./apiClient.ts";
 
 const DIRECT_BASE64_THRESHOLD_BYTES = 4 * 1024 * 1024; // 4 MB
 const CHUNK_SIZE_BYTES = 2 * 1024 * 1024; // 2 MB raw binary per request (safe under Cloud Run 32 MB limit)
@@ -46,26 +47,24 @@ export async function prepareUploadPayload(
     return { fileBase64 };
   }
 
-  const initRes = await fetch("/api/uploads/init", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      fileName: file.name,
-      fileSize: file.size,
-      mimeType: inferUploadMimeType(file),
-    }),
-  });
+  const { data: initData } = await safeFetchJson<{ uploadId?: string; message?: string }>(
+    "/api/uploads/init",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fileName: file.name,
+        fileSize: file.size,
+        mimeType: inferUploadMimeType(file),
+      }),
+    }
+  );
 
-  const initRaw = await initRes.text();
-  let initData: { uploadId?: string; message?: string } = {};
-  try {
-    initData = JSON.parse(initRaw);
-  } catch {
-    // Ignore parse error; fallback below
-  }
-
-  if (!initRes.ok || !initData.uploadId) {
-    throw new Error(initData.message || `تعذر بدء رفع الملف (${initRes.status}).`);
+  if (!initData.uploadId) {
+    throw new ApiResponseError(initData.message || "تعذر بدء جلسة رفع الملف.", {
+      status: 500,
+      code: "UPLOAD_INIT_FAILED",
+    });
   }
 
   const uploadId = initData.uploadId;
@@ -76,21 +75,32 @@ export async function prepareUploadPayload(
       const end = Math.min(offset + CHUNK_SIZE_BYTES, file.size);
       const chunkBuffer = await file.slice(offset, end).arrayBuffer();
 
-      const chunkRes = await fetch(`/api/uploads/${encodeURIComponent(uploadId)}/chunk`, {
-        method: "POST",
-        headers: { "Content-Type": "application/octet-stream" },
-        body: chunkBuffer,
-      });
+      const chunkRes = await fetch(
+        resolveApiUrl(`/api/uploads/${encodeURIComponent(uploadId)}/chunk`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: chunkBuffer,
+        }
+      );
 
       if (!chunkRes.ok) {
+        const rawErr = await chunkRes.text();
+        if (looksLikeHtmlResponse(rawErr, chunkRes.headers.get("content-type"))) {
+          throw new ApiResponseError("أعاد الخادم صفحة HTML أثناء رفع أجزاء الملف.", {
+            status: chunkRes.status,
+            code: "HTML_INSTEAD_OF_JSON",
+            isHtmlFallback: true,
+          });
+        }
         let msg = `فشل إرسال جزء من الملف (${chunkRes.status}).`;
         try {
-          const errJson = await chunkRes.json();
+          const errJson = JSON.parse(rawErr) as { message?: string };
           if (errJson?.message) msg = errJson.message;
         } catch {
           // Ignore parse error
         }
-        throw new Error(msg);
+        throw new ApiResponseError(msg, { status: chunkRes.status });
       }
 
       offset = end;
@@ -99,7 +109,9 @@ export async function prepareUploadPayload(
 
     return { uploadId };
   } catch (err) {
-    fetch(`/api/uploads/${encodeURIComponent(uploadId)}`, { method: "DELETE" }).catch(() => {});
+    fetch(resolveApiUrl(`/api/uploads/${encodeURIComponent(uploadId)}`), {
+      method: "DELETE",
+    }).catch(() => {});
     throw err;
   }
 }

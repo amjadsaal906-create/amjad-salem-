@@ -34,6 +34,12 @@ import {
   speakWithGeminiTTS,
 } from "../utils/speech.ts";
 import { buildDemoChatReply } from "../utils/demoSamples.ts";
+import {
+  ApiResponseError,
+  getAiPhaseMessage,
+  type AiRequestPhase,
+} from "../utils/apiClient.ts";
+import { sendChatRequest, transcribeMediaAudio } from "../utils/aiApi.ts";
 
 interface SmartChatbotProps {
   lesson: LessonData;
@@ -96,6 +102,7 @@ export const SmartChatbot: React.FC<SmartChatbotProps> = ({
   const [input, setInput] = useState("");
   const [actionMode, setActionMode] = useState<ChatActionMode>("explain");
   const [isSending, setIsSending] = useState(false);
+  const [requestPhase, setRequestPhase] = useState<AiRequestPhase>("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const [isRecording, setIsRecording] = useState(false);
@@ -184,12 +191,11 @@ export const SmartChatbot: React.FC<SmartChatbotProps> = ({
     }
 
     setIsSending(true);
+    setRequestPhase("connecting");
 
     try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const data = await sendChatRequest(
+        {
           role: userRole,
           messages: updatedHistory.map((m) => ({ sender: m.sender, text: m.text })),
           lessonTitle: lesson.title,
@@ -202,14 +208,9 @@ export const SmartChatbot: React.FC<SmartChatbotProps> = ({
           weakSpots,
           accommodations: settings.accommodations,
           simplifiedMode: settings.simplifiedMode,
-        }),
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        setErrorMsg(data.message || (isAr ? "حدث خطأ أثناء استجابة البوت الذكي." : "Chatbot request failed."));
-        return;
-      }
+        },
+        { onPhaseChange: setRequestPhase }
+      );
 
       if (Array.isArray(data.detectedWeakSpots) && data.detectedWeakSpots.length > 0) {
         onRecordWeakSpots(data.detectedWeakSpots);
@@ -246,8 +247,12 @@ export const SmartChatbot: React.FC<SmartChatbotProps> = ({
       if (settings.autoReadResponses) {
         speakWithBrowser(botMsg.text, settings.speechRate, undefined, undefined, chatLanguage);
       }
-    } catch {
-      setErrorMsg(isAr ? "تعذر الاتصال بخادم المساعد الذكي." : "Could not reach the AI Tutor server.");
+    } catch (err) {
+      if (err instanceof ApiResponseError) {
+        setErrorMsg(err.message);
+      } else {
+        setErrorMsg(isAr ? "تعذر الاتصال بخادم المساعد الذكي." : "Could not reach the AI Tutor server.");
+      }
     } finally {
       setIsSending(false);
     }
@@ -279,24 +284,23 @@ export const SmartChatbot: React.FC<SmartChatbotProps> = ({
           setIsTranscribing(true);
           try {
             const audioBase64 = await blobToBase64(blob);
-            const res = await fetch("/api/stt", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                audioBase64,
-                mimeType: blob.type || "audio/webm",
-                mode: "transcribe",
-                language: chatLanguage,
-              }),
+            const data = await transcribeMediaAudio({
+              audioBase64,
+              mimeType: blob.type || "audio/webm",
+              mode: "transcribe",
+              language: chatLanguage,
             });
-            const data = await res.json();
-            if (!res.ok) {
-              setErrorMsg(data.message || (isAr ? "تعذر تحويل الصوت إلى نص عبر الخادم." : "Audio transcription failed."));
-            } else if (data.transcript) {
+            if (data.transcript) {
               setInput(data.transcript);
             }
-          } catch {
-            setErrorMsg(isAr ? "تعذر إرسال التسجيل الصوتي للتحويل." : "Failed to upload voice recording.");
+          } catch (err) {
+            setErrorMsg(
+              err instanceof ApiResponseError
+                ? err.message
+                : isAr
+                  ? "تعذر إرسال التسجيل الصوتي للتحويل."
+                  : "Failed to upload voice recording."
+            );
           } finally {
             setIsTranscribing(false);
           }
@@ -896,9 +900,10 @@ export const SmartChatbot: React.FC<SmartChatbotProps> = ({
             <div className="flex items-center gap-2 text-sm" style={{ color: "var(--text-secondary)" }}>
               <Loader2 className="w-4 h-4 animate-spin" />
               <span>
-                {isAr
-                  ? "جارٍ تحليل السؤال والتحقق من مصادر الدرس..."
-                  : "Analyzing question and verifying lesson sources..."}
+                {getAiPhaseMessage(requestPhase, uiLang) ||
+                  (isAr
+                    ? "جارٍ تحليل السؤال والتحقق من مصادر الدرس..."
+                    : "Analyzing question and verifying lesson sources...")}
               </span>
             </div>
           )}

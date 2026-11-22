@@ -32,6 +32,8 @@ import {
   type WorldDiscoveryResult,
 } from "../utils/demoSamples.ts";
 import { speakWithBrowser, stopAllSpeech } from "../utils/speech.ts";
+import { getAiPhaseMessage, type AiRequestPhase } from "../utils/apiClient.ts";
+import { discoverWorldObject } from "../utils/aiApi.ts";
 
 interface DiscoverWorldExplorerProps {
   uiLang: UILanguage;
@@ -226,6 +228,7 @@ export const DiscoverWorldExplorer: React.FC<DiscoverWorldExplorerProps> = ({
   const [question, setQuestion] = useState("");
 
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [requestPhase, setRequestPhase] = useState<AiRequestPhase>("idle");
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [activeResult, setActiveResult] = useState<WorldDiscoveryResult | null>(null);
   const [resultProvenance, setResultProvenance] = useState<DiscoveryProvenance | null>(null);
@@ -375,27 +378,18 @@ export const DiscoverWorldExplorer: React.FC<DiscoverWorldExplorerProps> = ({
         return;
       }
 
+      setRequestPhase("connecting");
       try {
-        const res = await fetch("/api/discover-object", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
+        const data = await discoverWorldObject(
+          {
             imageBase64: base64,
             mimeType,
             question: customQuestion.trim(),
             language: uiLang,
             studentLevel,
-          }),
-        });
-        const data = await res.json();
-        if (!res.ok || !data.objectName) {
-          throw new Error(
-            data.message ||
-              (isAr
-                ? "تعذر تحليل الصورة بالذكاء الاصطناعي حالياً."
-                : "Could not analyze image with AI right now.")
-          );
-        }
+          },
+          { onPhaseChange: setRequestPhase }
+        );
 
         const parsed: WorldDiscoveryResult = {
           objectName: String(data.objectName || ""),
@@ -803,7 +797,8 @@ export const DiscoverWorldExplorer: React.FC<DiscoverWorldExplorerProps> = ({
                     <div className="absolute inset-0 bg-black/50 backdrop-blur-xs flex flex-col items-center justify-center gap-2 text-white p-4 text-center">
                       <Loader2 className="w-8 h-8 animate-spin" />
                       <span className="text-sm font-bold">
-                        {isAr ? "جارٍ التعرّف على العنصر وشرحه علمياً..." : "Identifying object & analyzing science..."}
+                        {getAiPhaseMessage(requestPhase, uiLang) ||
+                          (isAr ? "جارٍ التعرّف على العنصر وشرحه علمياً..." : "Identifying object & analyzing science...")}
                       </span>
                     </div>
                   )}

@@ -5,8 +5,17 @@ import path from "path";
 import dotenv from "dotenv";
 import JSZip from "jszip";
 import { WebSocketServer, WebSocket } from "ws";
-import { GoogleGenAI, Type } from "@google/genai";
+import { Type, type GoogleGenAI } from "@google/genai";
 import { createServer as createViteServer } from "vite";
+import {
+  CHAT_MODEL,
+  STT_MODEL,
+  TTS_MODEL,
+  VEO_MODEL,
+  callGeminiStructured,
+  formatGeminiError,
+  getGeminiClient,
+} from "./server-gemini.ts";
 import {
   seedLessonsIfEmpty,
   listAllLessons,
@@ -38,105 +47,14 @@ import {
   attachRadarWebSocket,
   registerRadarRoutes,
 } from "./server-radar.ts";
-import type { BookRecord, BookUnit, PreparationTemplate } from "./src/types.ts";
+import type { BookRecord, BookUnit, PreparationTemplate, PresentationDeckData } from "./src/types.ts";
 
 dotenv.config();
 
 const PORT = Number(process.env.PORT || 3000);
-const CHAT_MODEL = "gemini-4-hydrogen";
-const FALLBACK_CHAT_MODEL = "gemini-3.1-flash-lite";
-const TTS_MODEL = "gemini-3.8-flash-lite-tts";
-const STT_MODEL = "gemini-3.5-transcribe";
-const VEO_MODEL = "gemini-omni-1.2-flash";
 
 // Seed SQLite with default 5-subject lessons if empty
 seedLessonsIfEmpty(INITIAL_LESSONS as unknown as Array<Record<string, unknown>>);
-
-function getGeminiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
-    return null;
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        "User-Agent": "aistudio-build",
-      },
-    },
-  });
-}
-
-async function generateWithFallback(
-  ai: GoogleGenAI,
-  params: Omit<Parameters<GoogleGenAI["models"]["generateContent"]>[0], "model">
-) {
-  const modelsToTry = [CHAT_MODEL, FALLBACK_CHAT_MODEL];
-  let lastErr: unknown = null;
-  for (let i = 0; i < modelsToTry.length; i++) {
-    const model = modelsToTry[i];
-    try {
-      return await ai.models.generateContent({ ...params, model });
-    } catch (err) {
-      lastErr = err;
-      const raw = err instanceof Error ? err.message : String(err);
-      const lower = raw.toLowerCase();
-      console.error(`[Gemini ${model}]`, raw.slice(0, 300));
-      const isTransientOrQuota =
-        lower.includes("429") ||
-        lower.includes("resource_exhausted") ||
-        lower.includes("503") ||
-        lower.includes("unavailable") ||
-        lower.includes("not_found") ||
-        lower.includes("404");
-      if (!isTransientOrQuota || i === modelsToTry.length - 1) {
-        throw err;
-      }
-      await new Promise((r) => setTimeout(r, 350));
-    }
-  }
-  throw lastErr;
-}
-
-function formatGeminiError(err: unknown): { status: number; message: string; code: string } {
-  const raw = err instanceof Error ? err.message : String(err);
-  const lower = raw.toLowerCase();
-
-  if (lower.includes("api_key_invalid") || lower.includes("permission_denied") || lower.includes("403")) {
-    return {
-      status: 403,
-      code: "GEMINI_AUTH_ERROR",
-      message:
-        "تعذر التحقق من صلاحية مفتاح GEMINI_API_KEY. يرجى التأكد من تهيئة المفتاح في لوحة Settings > Secrets.",
-    };
-  }
-  if (lower.includes("resource_exhausted") || lower.includes("429")) {
-    return {
-      status: 429,
-      code: "GEMINI_QUOTA_ERROR",
-      message: "تم تجاوز حد الطلبات أو يلزم تفعيل مفتاح مدفوع لهذا النموذج في Settings > Secrets.",
-    };
-  }
-  if (lower.includes("not_found") || lower.includes("404")) {
-    return {
-      status: 404,
-      code: "GEMINI_MODEL_NOT_FOUND",
-      message: "النموذج المطلوب غير متاح حالياً. يرجى مراجعة إعدادات النموذج.",
-    };
-  }
-  if (lower.includes("unavailable") || lower.includes("503") || lower.includes("high demand")) {
-    return {
-      status: 503,
-      code: "GEMINI_UNAVAILABLE",
-      message: "خادم الذكاء الاصطناعي يواجه ضغطاً مؤقتاً حالياً (503). يرجى إعادة المحاولة بعد لحظات.",
-    };
-  }
-  return {
-    status: 500,
-    code: "GEMINI_API_ERROR",
-    message: `حدث خطأ أثناء الاتصال بخدمة الذكاء الاصطناعي: ${raw}`,
-  };
-}
 
 function buildSourcesText(sources: unknown): string {
   const activeSources = Array.isArray(sources)
@@ -481,14 +399,6 @@ function normalizeUploadMimeType(fileName: string, rawMime?: string): string {
   return mime || "application/pdf";
 }
 
-function stripJsonFences(raw: string): string {
-  return String(raw || "{}")
-    .trim()
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/i, "")
-    .trim();
-}
-
 async function waitForUploadedFileActive(
   ai: GoogleGenAI,
   uploaded: { name?: string; uri?: string; state?: string }
@@ -664,75 +574,82 @@ ${langHint}`;
   try {
     const parts = await prepareBookModelParts(ai, existing, instruction);
 
-    const response = await generateWithFallback(ai, {
-      contents: { parts },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            bookTitle: { type: Type.STRING },
-            bookSummary: { type: Type.STRING },
-            totalPagesEstimated: { type: Type.INTEGER },
-            units: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  unitNumber: { type: Type.STRING },
-                  unitTitle: { type: Type.STRING },
-                  startPage: { type: Type.INTEGER },
-                  endPage: { type: Type.INTEGER },
-                  chapters: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        chapterNumber: { type: Type.STRING },
-                        chapterTitle: { type: Type.STRING },
-                        startPage: { type: Type.INTEGER },
-                        endPage: { type: Type.INTEGER },
-                        lessons: {
-                          type: Type.ARRAY,
-                          items: {
-                            type: Type.OBJECT,
-                            properties: {
-                              lessonNumber: { type: Type.STRING },
-                              title: { type: Type.STRING },
-                              startPage: { type: Type.INTEGER },
-                              endPage: { type: Type.INTEGER },
-                              summary: { type: Type.STRING },
-                              objectives: { type: Type.ARRAY, items: { type: Type.STRING } },
-                              keyConcepts: { type: Type.ARRAY, items: { type: Type.STRING } },
-                              contentExcerpt: { type: Type.STRING },
+    const parsed = await callGeminiStructured<{
+      bookTitle?: string;
+      bookSummary?: string;
+      totalPagesEstimated?: number;
+      units?: Array<Record<string, unknown>>;
+    }>(
+      ai,
+      {
+        contents: { parts },
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              bookTitle: { type: Type.STRING },
+              bookSummary: { type: Type.STRING },
+              totalPagesEstimated: { type: Type.INTEGER },
+              units: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    unitNumber: { type: Type.STRING },
+                    unitTitle: { type: Type.STRING },
+                    startPage: { type: Type.INTEGER },
+                    endPage: { type: Type.INTEGER },
+                    chapters: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          chapterNumber: { type: Type.STRING },
+                          chapterTitle: { type: Type.STRING },
+                          startPage: { type: Type.INTEGER },
+                          endPage: { type: Type.INTEGER },
+                          lessons: {
+                            type: Type.ARRAY,
+                            items: {
+                              type: Type.OBJECT,
+                              properties: {
+                                lessonNumber: { type: Type.STRING },
+                                title: { type: Type.STRING },
+                                startPage: { type: Type.INTEGER },
+                                endPage: { type: Type.INTEGER },
+                                summary: { type: Type.STRING },
+                                objectives: { type: Type.ARRAY, items: { type: Type.STRING } },
+                                keyConcepts: { type: Type.ARRAY, items: { type: Type.STRING } },
+                                contentExcerpt: { type: Type.STRING },
+                              },
+                              required: [
+                                "lessonNumber",
+                                "title",
+                                "startPage",
+                                "endPage",
+                                "summary",
+                                "objectives",
+                                "keyConcepts",
+                                "contentExcerpt",
+                              ],
                             },
-                            required: [
-                              "lessonNumber",
-                              "title",
-                              "startPage",
-                              "endPage",
-                              "summary",
-                              "objectives",
-                              "keyConcepts",
-                              "contentExcerpt",
-                            ],
                           },
                         },
+                        required: ["chapterNumber", "chapterTitle", "startPage", "endPage", "lessons"],
                       },
-                      required: ["chapterNumber", "chapterTitle", "startPage", "endPage", "lessons"],
                     },
                   },
+                  required: ["unitNumber", "unitTitle", "startPage", "endPage", "chapters"],
                 },
-                required: ["unitNumber", "unitTitle", "startPage", "endPage", "chapters"],
               },
             },
+            required: ["bookTitle", "bookSummary", "totalPagesEstimated", "units"],
           },
-          required: ["bookTitle", "bookSummary", "totalPagesEstimated", "units"],
         },
       },
-    });
-
-    const parsed = JSON.parse(stripJsonFences(response.text ?? "{}"));
+      { label: "Analyze Book" }
+    );
     const rawUnits = Array.isArray(parsed.units) ? parsed.units : [];
 
     const normalizedUnits: BookUnit[] = rawUnits.map((u: Record<string, unknown>, uIdx: number) => {
@@ -791,6 +708,18 @@ ${langHint}`;
 
 async function startServer() {
   const app = express();
+  app.use((req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-Requested-With"
+    );
+    if (req.method === "OPTIONS") {
+      return res.status(204).end();
+    }
+    return next();
+  });
   app.use(express.json({ limit: "60mb" }));
 
   // 0. Chunked Binary Upload Endpoints (for large PDFs / textbooks bypassing HTTP body limits)
@@ -1023,49 +952,56 @@ ${sourcesBlock}`;
         },
       };
 
-      const response = await generateWithFallback(ai, {
-        contents: conversationContents,
-        config: {
-          systemInstruction,
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              reply: { type: Type.STRING },
-              outOfScopeNotice: { type: Type.STRING },
-              alternativeExplanation: { type: Type.STRING },
-              citations: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    sourceTitle: { type: Type.STRING },
-                    excerptUsed: { type: Type.STRING },
-                    withinApprovedSources: { type: Type.BOOLEAN },
+      const parsed = await callGeminiStructured<Record<string, unknown>>(
+        ai,
+        {
+          contents: conversationContents,
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                reply: { type: Type.STRING },
+                outOfScopeNotice: { type: Type.STRING },
+                alternativeExplanation: { type: Type.STRING },
+                citations: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      sourceTitle: { type: Type.STRING },
+                      excerptUsed: { type: Type.STRING },
+                      withinApprovedSources: { type: Type.BOOLEAN },
+                    },
                   },
                 },
-              },
-              detectedWeakSpots: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    concept: { type: Type.STRING },
-                    observation: { type: Type.STRING },
-                    suggestedRemediation: { type: Type.STRING },
+                detectedWeakSpots: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      concept: { type: Type.STRING },
+                      observation: { type: Type.STRING },
+                      suggestedRemediation: { type: Type.STRING },
+                    },
                   },
                 },
+                quickExercise: exerciseSchema,
+                remedialQuestions: { type: Type.ARRAY, items: exerciseSchema },
+                followUpSuggestions: { type: Type.ARRAY, items: { type: Type.STRING } },
               },
-              quickExercise: exerciseSchema,
-              remedialQuestions: { type: Type.ARRAY, items: exerciseSchema },
-              followUpSuggestions: { type: Type.ARRAY, items: { type: Type.STRING } },
+              required: ["reply", "citations", "detectedWeakSpots", "followUpSuggestions"],
             },
-            required: ["reply", "citations", "detectedWeakSpots", "followUpSuggestions"],
           },
         },
-      });
+        {
+          label: "Chat",
+          validate: (obj) => typeof obj.reply === "string" && obj.reply.trim().length > 0,
+        }
+      );
 
-      return res.json(JSON.parse((response.text ?? "{}").trim()));
+      return res.json(parsed);
     } catch (err) {
       const formatted = formatGeminiError(err);
       return res.status(formatted.status).json({ error: formatted.code, message: formatted.message });
@@ -1123,43 +1059,49 @@ ${sourcesBlock}`;
       const langHint = language === "en" ? "English" : language === "ar" ? "Arabic" : "Arabic or English";
 
       if (isVideo || mode === "video_captions") {
-        const response = await generateWithFallback(ai, {
-          contents: {
-            parts: [
-              { inlineData: { mimeType, data: audioBase64 } },
-              {
-                text: `Transcribe the spoken narration in this media in ${langHint} and segment it into accurate timed subtitle cues.`,
-              },
-            ],
-          },
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                transcript: { type: Type.STRING },
-                timedCaptions: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      startSec: { type: Type.NUMBER },
-                      endSec: { type: Type.NUMBER },
-                      text: { type: Type.STRING },
+        const parsed = await callGeminiStructured<{
+          transcript?: string;
+          timedCaptions?: Array<{ startSec: number; endSec: number; text: string }>;
+        }>(
+          ai,
+          {
+            contents: {
+              parts: [
+                { inlineData: { mimeType, data: audioBase64 } },
+                {
+                  text: `Transcribe the spoken narration in this media in ${langHint} and segment it into accurate timed subtitle cues.`,
+                },
+              ],
+            },
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  transcript: { type: Type.STRING },
+                  timedCaptions: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        startSec: { type: Type.NUMBER },
+                        endSec: { type: Type.NUMBER },
+                        text: { type: Type.STRING },
+                      },
+                      required: ["startSec", "endSec", "text"],
                     },
-                    required: ["startSec", "endSec", "text"],
                   },
                 },
+                required: ["transcript", "timedCaptions"],
               },
-              required: ["transcript", "timedCaptions"],
             },
           },
-        });
-        const parsed = JSON.parse((response.text ?? "{}").trim());
+          { label: "STT Video Captions" }
+        );
         const timedCaptions = Array.isArray(parsed.timedCaptions) ? parsed.timedCaptions : [];
         return res.json({
           transcript: parsed.transcript || "",
-          captions: timedCaptions.map((c: { text: string }) => c.text),
+          captions: timedCaptions.map((c) => c.text),
           timedCaptions,
           vtt: buildVtt(timedCaptions),
         });
@@ -1218,30 +1160,34 @@ ${sourcesBlock}`;
       }
       if (!base64Data) return res.status(400).json({ message: "تعذر العثور على الصورة." });
 
-      const response = await generateWithFallback(ai, {
-        contents: {
-          parts: [
-            { inlineData: { mimeType: resolvedMime, data: base64Data } },
-            {
-              text: `صف هذه الصورة العلمية المرتبطة بدرس "${lessonTitle}" باللغة العربية وصفاً مكانياً دقيقاً للمكفوفين وضعاف البصر.`,
+      const parsed = await callGeminiStructured<Record<string, unknown>>(
+        ai,
+        {
+          contents: {
+            parts: [
+              { inlineData: { mimeType: resolvedMime, data: base64Data } },
+              {
+                text: `صف هذه الصورة العلمية المرتبطة بدرس "${lessonTitle}" باللغة العربية وصفاً مكانياً دقيقاً للمكفوفين وضعاف البصر.`,
+              },
+            ],
+          },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                shortAlt: { type: Type.STRING },
+                detailedSpatialDescription: { type: Type.STRING },
+                scientificComponents: { type: Type.ARRAY, items: { type: Type.STRING } },
+                keyTakeaway: { type: Type.STRING },
+              },
+              required: ["shortAlt", "detailedSpatialDescription", "scientificComponents", "keyTakeaway"],
             },
-          ],
-        },
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              shortAlt: { type: Type.STRING },
-              detailedSpatialDescription: { type: Type.STRING },
-              scientificComponents: { type: Type.ARRAY, items: { type: Type.STRING } },
-              keyTakeaway: { type: Type.STRING },
-            },
-            required: ["shortAlt", "detailedSpatialDescription", "scientificComponents", "keyTakeaway"],
           },
         },
-      });
-      return res.json(JSON.parse((response.text ?? "{}").trim()));
+        { label: "Describe Image" }
+      );
+      return res.json(parsed);
     } catch (err) {
       const formatted = formatGeminiError(err);
       return res.status(formatted.status).json({ error: formatted.code, message: formatted.message });
@@ -1318,58 +1264,49 @@ If parts of the image are blurry, still identify the most likely object based on
 ${levelHint}${customQuestionPart}
 حتى لو كانت الزاوية قريبة أو الإضاءة متوسطة، حدّد العنصر الأقرب بناءً على الشكل والألوان والعبوة وقدّم المعلومة العلمية المرتبطة به.`;
 
-      const response = await generateWithFallback(ai, {
-        contents: [
-          {
-            role: "user",
-            parts: [
-              { inlineData: { mimeType: safeMimeType, data: cleanBase64 } },
-              { text: prompt },
-            ],
-          },
-        ],
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              objectName: { type: Type.STRING },
-              discipline: { type: Type.STRING },
-              summary: { type: Type.STRING },
-              scientificExplanation: { type: Type.STRING },
-              keyFacts: { type: Type.ARRAY, items: { type: Type.STRING } },
-              relatedConcepts: { type: Type.ARRAY, items: { type: Type.STRING } },
-              experimentIdea: { type: Type.STRING },
-              funQuestion: { type: Type.STRING },
-              funAnswer: { type: Type.STRING },
+      const parsed = await callGeminiStructured<{ objectName?: string } & Record<string, unknown>>(
+        ai,
+        {
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { inlineData: { mimeType: safeMimeType, data: cleanBase64 } },
+                { text: prompt },
+              ],
             },
-            required: [
-              "objectName",
-              "discipline",
-              "summary",
-              "scientificExplanation",
-              "keyFacts",
-              "relatedConcepts",
-              "experimentIdea",
-              "funQuestion",
-              "funAnswer",
-            ],
+          ],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                objectName: { type: Type.STRING },
+                discipline: { type: Type.STRING },
+                summary: { type: Type.STRING },
+                scientificExplanation: { type: Type.STRING },
+                keyFacts: { type: Type.ARRAY, items: { type: Type.STRING } },
+                relatedConcepts: { type: Type.ARRAY, items: { type: Type.STRING } },
+                experimentIdea: { type: Type.STRING },
+                funQuestion: { type: Type.STRING },
+                funAnswer: { type: Type.STRING },
+              },
+              required: [
+                "objectName",
+                "discipline",
+                "summary",
+                "scientificExplanation",
+                "keyFacts",
+                "relatedConcepts",
+                "experimentIdea",
+                "funQuestion",
+                "funAnswer",
+              ],
+            },
           },
         },
-      });
-
-      const rawText = (response.text ?? "{}").trim();
-      const cleanedJson = rawText
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/\s*```$/i, "")
-        .trim();
-      const startIdx = cleanedJson.indexOf("{");
-      const endIdx = cleanedJson.lastIndexOf("}");
-      const jsonSlice =
-        startIdx !== -1 && endIdx > startIdx
-          ? cleanedJson.slice(startIdx, endIdx + 1)
-          : cleanedJson;
-      const parsed = JSON.parse(jsonSlice || "{}");
+        { label: "Discover Object" }
+      );
 
       if (!parsed.objectName || !String(parsed.objectName).trim()) {
         return res.status(502).json({
@@ -1399,33 +1336,40 @@ ${levelHint}${customQuestionPart}
       if (!String(text).trim()) return res.status(400).json({ message: "يرجى إدخال نص لتبسيطه." });
       const targetLang = language === "en" ? "English" : "Arabic";
 
-      const response = await generateWithFallback(ai, {
-        contents: `Simplify the following scientific text for a ${studentLevel} learner in "${lessonTitle}" into 4-5 short numbered steps in ${targetLang}:\n\n${text}`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              steps: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    stepNumber: { type: Type.INTEGER },
-                    title: { type: Type.STRING },
-                    simpleSentence: { type: Type.STRING },
-                    visualCue: { type: Type.STRING },
-                    checkQuestion: { type: Type.STRING },
+      const parsed = await callGeminiStructured<{ steps?: unknown[] }>(
+        ai,
+        {
+          contents: `Simplify the following scientific text for a ${studentLevel} learner in "${lessonTitle}" into 4-5 short numbered steps in ${targetLang}:\n\n${text}`,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                steps: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      stepNumber: { type: Type.INTEGER },
+                      title: { type: Type.STRING },
+                      simpleSentence: { type: Type.STRING },
+                      visualCue: { type: Type.STRING },
+                      checkQuestion: { type: Type.STRING },
+                    },
+                    required: ["stepNumber", "title", "simpleSentence", "visualCue", "checkQuestion"],
                   },
-                  required: ["stepNumber", "title", "simpleSentence", "visualCue", "checkQuestion"],
                 },
               },
+              required: ["steps"],
             },
-            required: ["steps"],
           },
         },
-      });
-      return res.json(JSON.parse((response.text ?? "{}").trim()));
+        {
+          label: "Simplify",
+          validate: (obj) => Array.isArray(obj.steps) && obj.steps.length > 0,
+        }
+      );
+      return res.json(parsed);
     } catch (err) {
       const formatted = formatGeminiError(err);
       return res.status(formatted.status).json({ error: formatted.code, message: formatted.message });
@@ -1439,33 +1383,67 @@ ${levelHint}${customQuestionPart}
       return res.status(503).json({ error: "GEMINI_NOT_CONFIGURED", message: "مفتاح GEMINI_API_KEY غير مهيأ." });
     }
     try {
-      const { lessonTitle = "", sources = [], weakConcepts = [], accommodations = [], difficulty = "easy" } =
-        req.body ?? {};
-      const sourceText = Array.isArray(sources) ? sources.map((s: { content?: string }) => s.content || "").join("\n") : "";
-      const response = await generateWithFallback(ai, {
-        contents: `صمّم سؤالاً علمياً مرناً لدرس "${lessonTitle}" من المصادر:\n${sourceText}\nالتركيز: ${
-          weakConcepts.join("، ") || "الفهم الأساسي"
-        }\nالمستوى: ${difficulty}\nالتسهيلات: ${accommodations.join("، ") || "قياسي"}`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              concept: { type: Type.STRING },
-              difficulty: { type: Type.STRING },
-              prompt: { type: Type.STRING },
-              simplifiedPrompt: { type: Type.STRING },
-              options: { type: Type.ARRAY, items: { type: Type.STRING } },
-              correctIndex: { type: Type.INTEGER },
-              hint: { type: Type.STRING },
-              explanation: { type: Type.STRING },
-              visualCue: { type: Type.STRING },
+      const {
+        lessonTitle = "",
+        sources = [],
+        weakConcepts = [],
+        accommodations = [],
+        difficulty = "easy",
+        studentLevel = "intermediate",
+        studentStats = null,
+        language = "ar",
+      } = req.body ?? {};
+
+      const sourceText = Array.isArray(sources)
+        ? sources.map((s: { content?: string }) => s.content || "").join("\n").trim()
+        : "";
+
+      if (!String(lessonTitle).trim() && !sourceText) {
+        return res.status(400).json({
+          error: "MISSING_ADAPTIVE_CONTEXT",
+          message: "يرجى تحديد عنوان الدرس أو مصادره لتوليد سؤال تكيفي.",
+        });
+      }
+
+      const statsLine =
+        studentStats && typeof studentStats === "object"
+          ? `أداء الطالب الحالي: أجاب عن ${Number((studentStats as { answered?: number }).answered || 0)} سؤالاً بمعدل صحة ${Number((studentStats as { correct?: number }).correct || 0)}.`
+          : "";
+      const langLine = language === "en" ? "Write in clear English." : "اكتب السؤال والخيارات والتلميح والشرح بالعربية الواضحة.";
+
+      const parsed = await callGeminiStructured<Record<string, unknown>>(
+        ai,
+        {
+          contents: `صمّم سؤالاً علمياً تكيفياً مرناً لدرس "${lessonTitle}" من المصادر:\n${sourceText}\nالتركيز على المفاهيم التي تحتاج دعماً: ${
+            weakConcepts.join("، ") || "الفهم الأساسي"
+          }\nمستوى الطالب: ${studentLevel} · مستوى الصعوبة المطلوب: ${difficulty}\n${statsLine}\nالتسهيلات: ${
+            accommodations.join("، ") || "قياسي"
+          }\n${langLine}`,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                concept: { type: Type.STRING },
+                difficulty: { type: Type.STRING },
+                prompt: { type: Type.STRING },
+                simplifiedPrompt: { type: Type.STRING },
+                options: { type: Type.ARRAY, items: { type: Type.STRING } },
+                correctIndex: { type: Type.INTEGER },
+                hint: { type: Type.STRING },
+                explanation: { type: Type.STRING },
+                visualCue: { type: Type.STRING },
+              },
+              required: ["concept", "difficulty", "prompt", "simplifiedPrompt", "options", "correctIndex", "hint", "explanation", "visualCue"],
             },
-            required: ["concept", "difficulty", "prompt", "simplifiedPrompt", "options", "correctIndex", "hint", "explanation", "visualCue"],
           },
         },
-      });
-      return res.json({ id: `adaptive-${Date.now()}`, ...JSON.parse((response.text ?? "{}").trim()) });
+        {
+          label: "Adaptive Quiz",
+          validate: (obj) => typeof obj.prompt === "string" && Array.isArray(obj.options) && obj.options.length >= 2,
+        }
+      );
+      return res.json({ id: `adaptive-${Date.now()}`, ...parsed });
     } catch (err) {
       const formatted = formatGeminiError(err);
       return res.status(formatted.status).json({ error: formatted.code, message: formatted.message });
@@ -1624,35 +1602,45 @@ Extract rich classroom-ready content directly from those pages:
 ${langRule}`;
 
       const parts = await prepareBookModelParts(ai, book, instruction);
-      const response = await generateWithFallback(ai, {
-        contents: { parts },
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              summary: { type: Type.STRING },
-              simplifiedSummary: { type: Type.STRING },
-              objectives: { type: Type.ARRAY, items: { type: Type.STRING } },
-              keyConcepts: { type: Type.ARRAY, items: { type: Type.STRING } },
-              tablesAndFiguresSummary: { type: Type.ARRAY, items: { type: Type.STRING } },
-              keyFormulasOrRules: { type: Type.ARRAY, items: { type: Type.STRING } },
-              fullLessonText: { type: Type.STRING },
+      const extracted = await callGeminiStructured<{
+        summary?: string;
+        simplifiedSummary?: string;
+        objectives?: string[];
+        keyConcepts?: string[];
+        tablesAndFiguresSummary?: string[];
+        keyFormulasOrRules?: string[];
+        fullLessonText?: string;
+      }>(
+        ai,
+        {
+          contents: { parts },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                summary: { type: Type.STRING },
+                simplifiedSummary: { type: Type.STRING },
+                objectives: { type: Type.ARRAY, items: { type: Type.STRING } },
+                keyConcepts: { type: Type.ARRAY, items: { type: Type.STRING } },
+                tablesAndFiguresSummary: { type: Type.ARRAY, items: { type: Type.STRING } },
+                keyFormulasOrRules: { type: Type.ARRAY, items: { type: Type.STRING } },
+                fullLessonText: { type: Type.STRING },
+              },
+              required: [
+                "summary",
+                "simplifiedSummary",
+                "objectives",
+                "keyConcepts",
+                "tablesAndFiguresSummary",
+                "keyFormulasOrRules",
+                "fullLessonText",
+              ],
             },
-            required: [
-              "summary",
-              "simplifiedSummary",
-              "objectives",
-              "keyConcepts",
-              "tablesAndFiguresSummary",
-              "keyFormulasOrRules",
-              "fullLessonText",
-            ],
           },
         },
-      });
-
-      const extracted = JSON.parse(stripJsonFences(response.text ?? "{}"));
+        { label: "Extract Book Lesson" }
+      );
 
       // Persist enriched lesson excerpt back into SQLite book index
       if (unitId && chapterId && lessonEntryId && Array.isArray(book.units)) {
@@ -1800,8 +1788,15 @@ Extract:
         : [{ text: `${instruction}\n\nForm text:\n${extractedRawText.slice(0, 14000)}` }];
 
       const timeoutMs = usedMultimodalFile ? 35000 : 12000;
-      const response = await Promise.race([
-        generateWithFallback(ai, {
+      const parsed = await callGeminiStructured<{
+        templateName?: string;
+        institutionOrSchool?: string;
+        requiredSections?: string[];
+        rawStructureText?: string;
+        presentationMappingGuidelines?: string;
+      }>(
+        ai,
+        {
           contents: { parts },
           config: {
             responseMimeType: "application/json",
@@ -1823,13 +1818,9 @@ Extract:
               ],
             },
           },
-        }),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("503 GEMINI_TIMEOUT")), timeoutMs)
-        ),
-      ]);
-
-      const parsed = JSON.parse((response.text ?? "{}").trim());
+        },
+        { label: "Prep Template Extract", timeoutMs }
+      );
       const saved = upsertPrepTemplate({
         subjectScope,
         templateName: templateName.trim() || parsed.templateName || fileName.replace(/\.[^.]+$/, ""),
@@ -2043,34 +2034,42 @@ Extract:
         ];
       }
 
-      const response = await generateWithFallback(ai, {
-        contents: { parts },
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING },
-              summary: { type: Type.STRING },
-              simplifiedSummary: { type: Type.STRING },
-              content: { type: Type.STRING },
-              extractedAnalysis: {
-                type: Type.OBJECT,
-                properties: {
-                  concepts: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  objectives: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  tablesAndFiguresSummary: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  keyFormulasOrRules: { type: Type.ARRAY, items: { type: Type.STRING } },
+      const parsed = await callGeminiStructured<{
+        title?: string;
+        summary?: string;
+        simplifiedSummary?: string;
+        content?: string;
+        extractedAnalysis?: Record<string, unknown>;
+      }>(
+        ai,
+        {
+          contents: { parts },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                title: { type: Type.STRING },
+                summary: { type: Type.STRING },
+                simplifiedSummary: { type: Type.STRING },
+                content: { type: Type.STRING },
+                extractedAnalysis: {
+                  type: Type.OBJECT,
+                  properties: {
+                    concepts: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    objectives: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    tablesAndFiguresSummary: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    keyFormulasOrRules: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  },
+                  required: ["concepts", "objectives", "tablesAndFiguresSummary", "keyFormulasOrRules"],
                 },
-                required: ["concepts", "objectives", "tablesAndFiguresSummary", "keyFormulasOrRules"],
               },
+              required: ["title", "summary", "simplifiedSummary", "content", "extractedAnalysis"],
             },
-            required: ["title", "summary", "simplifiedSummary", "content", "extractedAnalysis"],
           },
         },
-      });
-
-      const parsed = JSON.parse(stripJsonFences(response.text ?? "{}"));
+        { label: "Extract Lesson" }
+      );
       return res.json({
         title: parsed.title || fileName.replace(/\.[^.]+$/, ""),
         category: `ملف مرفوع (${fileName})`,
@@ -2131,12 +2130,20 @@ Extract:
     }
   });
 
-  // 12. Generate Lesson Plan (التحضير وفق الفورمة المعتمدة)
+  // 12. Generate Lesson Plan (التحضير الذكي وفق الفورمة والمصادر والملفات المرفقة)
   app.post("/api/generate/lesson-plan", async (req, res) => {
     const ai = getGeminiClient();
     if (!ai) {
-      return res.status(503).json({ error: "GEMINI_NOT_CONFIGURED", message: "مفتاح GEMINI_API_KEY غير مهيأ." });
+      return res.status(503).json({
+        error: "GEMINI_NOT_CONFIGURED",
+        message:
+          "مفتاح GEMINI_API_KEY غير مهيأ على الخادم. يرجى التحقق من إعدادات الخادم أو ربط Cloudflare Worker (smart-science-ai-server).",
+      });
     }
+
+    const tempUploadIdsToClean: string[] = [];
+    const tempAdHocFilesToClean: string[] = [];
+
     try {
       const {
         lesson,
@@ -2144,7 +2151,18 @@ Extract:
         sourcePolicy = "lesson_only",
         prepTemplateId = "",
         prepTemplate = null,
+        teacherInputs = null,
+        attachedFiles = [],
+        attachedNotes = "",
       } = req.body ?? {};
+
+      if (!lesson || !String(lesson?.title || "").trim()) {
+        return res.status(400).json({
+          error: "MISSING_LESSON",
+          message: "يرجى اختيار درس أو إدخال عنوان الدرس قبل التوليد.",
+        });
+      }
+
       const sourcesText = buildSourcesText(lesson?.sources);
       const { template: resolvedTpl, promptBlock } = buildPrepTemplateContext(
         prepTemplate,
@@ -2152,8 +2170,133 @@ Extract:
       );
       const langRule =
         language === "en"
-          ? "Write the entire lesson plan in English."
-          : "اكتب تحضير الدرس كاملاً باللغة العربية.";
+          ? "Write the entire lesson plan in clear, academic English."
+          : "اكتب تحضير الدرس كاملاً باللغة العربية الفصحى العلمية الواضحة.";
+
+      // Gather rich baseline lesson metadata & extracted analysis when present
+      const analysis = lesson?.extractedAnalysis;
+      const lessonContextLines = [
+        lesson?.summary ? `ملخص الدرس: ${String(lesson.summary)}` : "",
+        lesson?.simplifiedSummary ? `التلخيص الميسر: ${String(lesson.simplifiedSummary)}` : "",
+        Array.isArray(analysis?.concepts) && analysis.concepts.length > 0
+          ? `المفاهيم الرئيسية: ${analysis.concepts.join("، ")}`
+          : "",
+        Array.isArray(analysis?.objectives) && analysis.objectives.length > 0
+          ? `الأهداف المستخرجة من الدرس: ${analysis.objectives.join(" | ")}`
+          : "",
+        Array.isArray(analysis?.keyFormulasOrRules) && analysis.keyFormulasOrRules.length > 0
+          ? `القوانين والمعادلات الأساسية: ${analysis.keyFormulasOrRules.join(" | ")}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      const tInputs =
+        teacherInputs && typeof teacherInputs === "object"
+          ? (teacherInputs as {
+              customTopic?: string;
+              focusObjectives?: string;
+              targetGroup?: string;
+              durationMinutes?: number;
+              extraInstructions?: string;
+            })
+          : null;
+
+      const resolvedDuration =
+        Number(tInputs?.durationMinutes) > 0
+          ? Number(tInputs?.durationMinutes)
+          : Number(lesson?.estimatedMinutes) || 45;
+
+      const teacherInputsBlock = tInputs
+        ? [
+            tInputs.customTopic ? `محور أو عنوان مخصص من المعلم: ${tInputs.customTopic}` : "",
+            tInputs.focusObjectives ? `أهداف ومخرجات يركز عليها المعلم: ${tInputs.focusObjectives}` : "",
+            tInputs.targetGroup ? `الفئة المستهدفة / مستوى الشعبة: ${tInputs.targetGroup}` : "",
+            tInputs.durationMinutes ? `مدة الحصة المطلوبة: ${tInputs.durationMinutes} دقيقة` : "",
+            tInputs.extraInstructions ? `ملاحظات وإرشادات إضافية من المعلم: ${tInputs.extraInstructions}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n")
+        : "";
+
+      const attachedNotesBlock = String(attachedNotes || "").trim()
+        ? `\nمحتوى إضافي / نص مصدر مرفق من المعلم:\n${String(attachedNotes).trim().slice(0, 12000)}`
+        : "";
+
+      // Process any files attached specifically inside the Lesson Plan tool
+      const multimodalParts: Array<Record<string, unknown>> = [];
+      const extractedAttachmentTexts: string[] = [];
+
+      if (Array.isArray(attachedFiles)) {
+        for (const item of attachedFiles.slice(0, 4)) {
+          if (!item || typeof item !== "object") continue;
+          const fileName = String((item as { fileName?: string }).fileName || "attachment");
+          const rawMime = String((item as { mimeType?: string }).mimeType || "");
+          const uploadId = String((item as { uploadId?: string }).uploadId || "");
+          const fileBase64 = String((item as { fileBase64?: string }).fileBase64 || "");
+          const textContent = String((item as { textContent?: string }).textContent || "");
+
+          if (uploadId) tempUploadIdsToClean.push(uploadId);
+
+          if (textContent.trim()) {
+            extractedAttachmentTexts.push(`[مرفق: ${fileName}]\n${textContent.trim().slice(0, 10000)}`);
+            continue;
+          }
+
+          const diskPath = uploadId ? safeTempUploadPath(uploadId) : null;
+          const hasDisk = Boolean(diskPath && fs.existsSync(diskPath));
+          if (!hasDisk && !fileBase64) continue;
+
+          const normalizedMime = normalizeUploadMimeType(fileName, rawMime);
+          const lowerName = fileName.toLowerCase();
+
+          const readBuf = () =>
+            hasDisk && diskPath ? fs.readFileSync(diskPath) : Buffer.from(fileBase64, "base64");
+
+          if (lowerName.endsWith(".docx") || normalizedMime.includes("wordprocessingml")) {
+            const docText = await extractTextFromOfficeZip(readBuf(), "docx");
+            if (docText) extractedAttachmentTexts.push(`[ملف Word مرفق: ${fileName}]\n${docText.slice(0, 10000)}`);
+          } else if (lowerName.endsWith(".pptx") || normalizedMime.includes("presentationml")) {
+            const pptText = await extractTextFromOfficeZip(readBuf(), "pptx");
+            if (pptText) extractedAttachmentTexts.push(`[عرض مرفق: ${fileName}]\n${pptText.slice(0, 10000)}`);
+          } else if (
+            normalizedMime.startsWith("text/") ||
+            lowerName.endsWith(".txt") ||
+            lowerName.endsWith(".md") ||
+            lowerName.endsWith(".csv")
+          ) {
+            const txt = readBuf().toString("utf-8").trim();
+            if (txt) extractedAttachmentTexts.push(`[ملف نصي مرفق: ${fileName}]\n${txt.slice(0, 10000)}`);
+          } else {
+            // PDF or image attachment
+            const byteLen =
+              hasDisk && diskPath ? fs.statSync(diskPath).size : Buffer.byteLength(fileBase64, "base64");
+            if (byteLen > 8 * 1024 * 1024) {
+              let sourcePath = diskPath;
+              if (!sourcePath || !fs.existsSync(sourcePath)) {
+                const ext = path.extname(fileName) || ".pdf";
+                const adHoc = path.join(TMP_UPLOADS_DIR, `lp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}${ext}`);
+                fs.writeFileSync(adHoc, Buffer.from(fileBase64, "base64"));
+                tempAdHocFilesToClean.push(adHoc);
+                sourcePath = adHoc;
+              }
+              const uploaded = await ai.files.upload({
+                file: sourcePath,
+                config: { mimeType: normalizedMime },
+              });
+              const activeFile = await waitForUploadedFileActive(ai, uploaded);
+              multimodalParts.push({
+                fileData: { fileUri: activeFile.uri, mimeType: normalizedMime },
+              });
+            } else {
+              const b64 = fileBase64 || readBuf().toString("base64");
+              multimodalParts.push({
+                inlineData: { mimeType: normalizedMime, data: b64 },
+              });
+            }
+          }
+        }
+      }
 
       const templateRule = resolvedTpl
         ? `\nالالتزام التام ببناء التحضير وفق فورمة التحضير المرفقة أدناه، مع تعبئة المصفوفة customFormFields لكل بند من بنود الفورمة (${
@@ -2163,75 +2306,141 @@ Extract:
           }) بمحتوى علمي دقيق ومفصل مستند إلى الدرس:\n${promptBlock}`
         : "";
 
-      const response = await generateWithFallback(ai, {
-        contents: `أعد تحضير درس احترافي متكامل لمادة "${lesson?.subject}"، المرحلة "${lesson?.stage}"، الصف "${lesson?.gradeLevel}"، عنوان الدرس "${lesson?.title}".
-سياسة المصادر: ${sourcePolicy}. التزم بمحتوى الدرس التالي:
+      const attachmentTextsBlock =
+        extractedAttachmentTexts.length > 0
+          ? `\n=== نصوص الملفات المرفقة من المعلم ===\n${extractedAttachmentTexts.join("\n\n")}`
+          : "";
+
+      const promptText = `أعد تحضير درس احترافي متكامل ومفصل واقعياً لمادة "${lesson?.subject || "العلوم"}"، المرحلة "${lesson?.stage || "high"}"، الصف "${lesson?.gradeLevel || ""}"، عنوان الدرس "${lesson?.title}"، بمدة مقترحة ${resolvedDuration} دقيقة.
+سياسة المصادر: ${sourcePolicy}.
+${lessonContextLines ? `\nسياق الدرس:\n${lessonContextLines}` : ""}
+${teacherInputsBlock ? `\nمدخلات المعلم المباشرة:\n${teacherInputsBlock}` : ""}
+
+مصادر الدرس المعتمدة:
 ${sourcesText}
+${attachedNotesBlock}
+${attachmentTextsBlock}
 ${templateRule}
-${langRule}`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              lessonTitle: { type: Type.STRING },
-              subject: { type: Type.STRING },
-              stage: { type: Type.STRING },
-              gradeLevel: { type: Type.STRING },
-              durationMinutes: { type: Type.INTEGER },
-              templateNameUsed: { type: Type.STRING },
-              objectives: { type: Type.ARRAY, items: { type: Type.STRING } },
-              warmUp: { type: Type.STRING },
-              teachingStrategies: { type: Type.ARRAY, items: { type: Type.STRING } },
-              learningActivities: { type: Type.ARRAY, items: { type: Type.STRING } },
-              resourcesAndMedia: { type: Type.ARRAY, items: { type: Type.STRING } },
-              assessment: { type: Type.STRING },
-              homework: { type: Type.STRING },
-              differentiationAndInclusion: { type: Type.STRING },
-              customFormFields: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    sectionName: { type: Type.STRING },
-                    content: { type: Type.STRING },
+${langRule}`;
+
+      const contentsPayload =
+        multimodalParts.length > 0
+          ? { parts: [...multimodalParts, { text: promptText }] }
+          : promptText;
+
+      const parsed = await callGeminiStructured<Record<string, unknown>>(
+        ai,
+        {
+          contents: contentsPayload,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                lessonTitle: { type: Type.STRING },
+                subject: { type: Type.STRING },
+                stage: { type: Type.STRING },
+                gradeLevel: { type: Type.STRING },
+                durationMinutes: { type: Type.INTEGER },
+                templateNameUsed: { type: Type.STRING },
+                objectives: { type: Type.ARRAY, items: { type: Type.STRING } },
+                warmUp: { type: Type.STRING },
+                teachingStrategies: { type: Type.ARRAY, items: { type: Type.STRING } },
+                learningActivities: { type: Type.ARRAY, items: { type: Type.STRING } },
+                resourcesAndMedia: { type: Type.ARRAY, items: { type: Type.STRING } },
+                assessment: { type: Type.STRING },
+                homework: { type: Type.STRING },
+                differentiationAndInclusion: { type: Type.STRING },
+                customFormFields: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      sectionName: { type: Type.STRING },
+                      content: { type: Type.STRING },
+                    },
+                    required: ["sectionName", "content"],
                   },
-                  required: ["sectionName", "content"],
                 },
               },
+              required: [
+                "lessonTitle",
+                "subject",
+                "stage",
+                "gradeLevel",
+                "durationMinutes",
+                "objectives",
+                "warmUp",
+                "teachingStrategies",
+                "learningActivities",
+                "resourcesAndMedia",
+                "assessment",
+                "homework",
+                "differentiationAndInclusion",
+                "customFormFields",
+              ],
             },
-            required: [
-              "lessonTitle",
-              "subject",
-              "stage",
-              "gradeLevel",
-              "durationMinutes",
-              "objectives",
-              "warmUp",
-              "teachingStrategies",
-              "learningActivities",
-              "resourcesAndMedia",
-              "assessment",
-              "homework",
-              "differentiationAndInclusion",
-              "customFormFields",
-            ],
           },
         },
-      });
-      const plan = JSON.parse((response.text ?? "{}").trim());
-      if (resolvedTpl && !plan.templateNameUsed) {
-        plan.templateNameUsed = String(resolvedTpl.templateName || "");
-      }
-      return res.json({ lessonPlan: plan });
+        {
+          label: "Lesson Plan",
+          validate: (obj) =>
+            Array.isArray(obj.objectives) &&
+            obj.objectives.length > 0 &&
+            typeof obj.warmUp === "string",
+        }
+      );
+      const plan = {
+        lessonTitle: String(parsed.lessonTitle || lesson.title || ""),
+        subject: String(parsed.subject || lesson.subject || ""),
+        stage: String(parsed.stage || lesson.stage || ""),
+        gradeLevel: String(parsed.gradeLevel || lesson.gradeLevel || ""),
+        durationMinutes: Number(parsed.durationMinutes || resolvedDuration) || 45,
+        templateNameUsed:
+          String(parsed.templateNameUsed || "") ||
+          (resolvedTpl ? String(resolvedTpl.templateName || "") : undefined),
+        objectives: Array.isArray(parsed.objectives) ? parsed.objectives.map(String).filter(Boolean) : [],
+        warmUp: String(parsed.warmUp || ""),
+        teachingStrategies: Array.isArray(parsed.teachingStrategies)
+          ? parsed.teachingStrategies.map(String).filter(Boolean)
+          : [],
+        learningActivities: Array.isArray(parsed.learningActivities)
+          ? parsed.learningActivities.map(String).filter(Boolean)
+          : [],
+        resourcesAndMedia: Array.isArray(parsed.resourcesAndMedia)
+          ? parsed.resourcesAndMedia.map(String).filter(Boolean)
+          : [],
+        assessment: String(parsed.assessment || ""),
+        homework: String(parsed.homework || ""),
+        differentiationAndInclusion: String(parsed.differentiationAndInclusion || ""),
+        customFormFields: Array.isArray(parsed.customFormFields)
+          ? parsed.customFormFields.map((f: { sectionName?: unknown; content?: unknown }) => ({
+              sectionName: String(f?.sectionName || ""),
+              content: String(f?.content || ""),
+            }))
+          : [],
+      };
+
+      return res.json({ lessonPlan: plan, source: "gemini-ai" });
     } catch (err) {
       const formatted = formatGeminiError(err);
       return res.status(formatted.status).json({ error: formatted.code, message: formatted.message });
+    } finally {
+      for (const uid of tempUploadIdsToClean) cleanupTempUpload(uid);
+      for (const fp of tempAdHocFilesToClean) {
+        if (fs.existsSync(fp)) {
+          try {
+            fs.unlinkSync(fp);
+          } catch {
+            // Ignore
+          }
+        }
+      }
     }
   });
 
   // 13. Generate Editable PowerPoint Deck JSON (PPTX مبني على الدرس وفورمة التحضير)
-  app.post("/api/generate/presentation", async (req, res) => {
+  const handleGeneratePresentation = async (req: express.Request, res: express.Response) => {
     const ai = getGeminiClient();
     if (!ai) {
       return res.status(503).json({ error: "GEMINI_NOT_CONFIGURED", message: "مفتاح GEMINI_API_KEY غير مهيأ." });
@@ -2239,12 +2448,19 @@ ${langRule}`,
     try {
       const {
         lesson,
-        slideCount = 7,
+        slideCount = 8,
         language = "ar",
         prepTemplateId = "",
         prepTemplate = null,
         lessonPlan = null,
       } = req.body ?? {};
+      if (!lesson || !String(lesson?.title || "").trim()) {
+        return res.status(400).json({
+          error: "MISSING_LESSON",
+          message: "يرجى اختيار درس أو إدخال عنوان الدرس قبل توليد العرض التقديمي.",
+        });
+      }
+      const safeSlideCount = Math.max(6, Math.min(14, Number(slideCount) || 8));
       const sourcesText = buildSourcesText(lesson?.sources);
       const { template: resolvedTpl, promptBlock } = buildPrepTemplateContext(
         prepTemplate,
@@ -2252,8 +2468,8 @@ ${langRule}`,
       );
       const langRule =
         language === "en"
-          ? "Write all slide content in English."
-          : "اكتب محتوى الشرائح باللغة العربية.";
+          ? "Write all slide content in clear, natural English."
+          : "اكتب جميع الشرائح وملاحظات المعلم والأسئلة باللغة العربية الفصحى العلمية السليمة.";
 
       const templateAlignment = resolvedTpl
         ? `\nابنِ تسلسل الشرائح ومحتوى كل شريحة وملاحظات المعلم بحيث تتطابق مع فورمة التحضير المعتمدة:\n${promptBlock}`
@@ -2262,48 +2478,61 @@ ${langRule}`,
         ? `\nواعتمد أيضاً على تحضير الدرس المبني مسبقاً:\n${JSON.stringify(lessonPlan).slice(0, 3500)}`
         : "";
 
-      const response = await generateWithFallback(ai, {
-        contents: `صمّم عرضاً تقديمياً تعليمياً منظماً من ${slideCount} شرائح لدرس "${lesson?.title}" (${lesson?.subject} - ${lesson?.gradeLevel}) استناداً للمصادر:
+      const rawDeck = await callGeminiStructured<Partial<PresentationDeckData>>(
+        ai,
+        {
+          contents: `صمّم عرضاً تقديمياً تعليمياً احترافياً من ${safeSlideCount} شرائح لدرس "${lesson?.title}" (${lesson?.subject || "العلوم"} - ${lesson?.gradeLevel || ""}) استناداً للمصادر:
 ${sourcesText}
 ${templateAlignment}
 ${planAlignment}
-تأكد من شمول: شريحة عنوان، الأهداف، شرح منظم للمفاهيم، شريحة رسم توضيحي (diagram)، أمثلة وتطبيقات، سؤال تفاعلي (interactive_quiz)، وملخص وتقويم ختامي (summary).
+يجب أن يغطي العرض المكونات التربوية التالية حسب طبيعة الدرس وبنقاط موجزة مناسبة للشرائح (لا تزيد كل شريحة عن 4-5 نقاط واضحة):
+1) شريحة العنوان (slideType: "title")
+2) المقدمة والتمهيد المثير للتفكير (slideType: "concept")
+3) الأهداف التعليمية (slideType: "objectives")
+4) شرح المحتوى العلمي الأساسي + شريحة رسم توضيحي (slideType: "concept" و "diagram")
+5) الأنشطة والتطبيقات العملية (slideType: "example")
+6) التقويم والأسئلة التفاعلية (slideType: "interactive_quiz" مع quizQuestion وquizOptions وquizAnswerIndex)
+7) الخاتمة والملخص الختامي (slideType: "summary")
 ${langRule}`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              deckTitle: { type: Type.STRING },
-              subject: { type: Type.STRING },
-              gradeLevel: { type: Type.STRING },
-              themeAccent: { type: Type.STRING },
-              templateNameUsed: { type: Type.STRING },
-              slides: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    slideNumber: { type: Type.INTEGER },
-                    slideType: { type: Type.STRING },
-                    title: { type: Type.STRING },
-                    subtitle: { type: Type.STRING },
-                    bullets: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    speakerNotes: { type: Type.STRING },
-                    visualNote: { type: Type.STRING },
-                    quizQuestion: { type: Type.STRING },
-                    quizOptions: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    quizAnswerIndex: { type: Type.INTEGER },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                deckTitle: { type: Type.STRING },
+                subject: { type: Type.STRING },
+                gradeLevel: { type: Type.STRING },
+                themeAccent: { type: Type.STRING },
+                templateNameUsed: { type: Type.STRING },
+                slides: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      slideNumber: { type: Type.INTEGER },
+                      slideType: { type: Type.STRING },
+                      title: { type: Type.STRING },
+                      subtitle: { type: Type.STRING },
+                      bullets: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      speakerNotes: { type: Type.STRING },
+                      visualNote: { type: Type.STRING },
+                      quizQuestion: { type: Type.STRING },
+                      quizOptions: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      quizAnswerIndex: { type: Type.INTEGER },
+                    },
+                    required: ["slideNumber", "slideType", "title", "bullets", "speakerNotes"],
                   },
-                  required: ["slideNumber", "slideType", "title", "bullets", "speakerNotes"],
                 },
               },
+              required: ["deckTitle", "subject", "gradeLevel", "themeAccent", "slides"],
             },
-            required: ["deckTitle", "subject", "gradeLevel", "themeAccent", "slides"],
           },
         },
-      });
-      const rawDeck = JSON.parse((response.text ?? "{}").trim());
+        {
+          label: "Generate Presentation",
+          validate: (obj) => Array.isArray(obj.slides) && obj.slides.length > 0,
+        }
+      );
       const deck = formatTemplateStructuredDeck({
         rawDeck,
         lesson,
@@ -2316,22 +2545,27 @@ ${langRule}`,
       const formatted = formatGeminiError(err);
       return res.status(formatted.status).json({ error: formatted.code, message: formatted.message });
     }
-  });
+  };
+  app.post("/api/generate/presentation", handleGeneratePresentation);
+  app.post("/api/generate/powerpoint", handleGeneratePresentation);
 
   // 13b. Auto-Generate Template-Aligned Slides + Server-Side .pptx File & Save to Platform
   app.post("/api/presentation/auto-pptx", async (req, res) => {
     const ai = getGeminiClient();
     const {
       lesson,
-      slideCount = 7,
+      slideCount = 8,
       language = "ar",
       prepTemplateId = "",
       prepTemplate = null,
       lessonPlan = null,
     } = req.body ?? {};
 
-    if (!lesson) {
-      return res.status(400).json({ message: "بيانات الدرس مطلوبة لإنشاء العرض التقديمي." });
+    if (!lesson || !String(lesson?.title || "").trim()) {
+      return res.status(400).json({
+        error: "MISSING_LESSON",
+        message: "بيانات الدرس مطلوبة لإنشاء العرض التقديمي.",
+      });
     }
 
     const lang = language === "en" ? "en" : "ar";
@@ -2352,13 +2586,13 @@ ${langRule}`,
       const sourcesText = buildSourcesText(lesson?.sources);
       const langRule =
         lang === "en"
-          ? "Write all slide titles, bullets, quiz items, and speaker notes in English."
-          : "اكتب جميع عناوين الشرائح ونقاط المحتوى والأسئلة وملاحظات المعلم باللغة العربية.";
+          ? "Write all slide titles, bullets, quiz items, and speaker notes in clear English."
+          : "اكتب جميع عناوين الشرائح ونقاط المحتوى والأسئلة وملاحظات المعلم باللغة العربية الفصحى العلمية السليمة.";
 
       const sectionCountHint =
         typedTpl && Array.isArray(typedTpl.requiredSections) && typedTpl.requiredSections.length > 0
-          ? Math.max(slideCount, Math.min(12, typedTpl.requiredSections.length + 3))
-          : slideCount;
+          ? Math.max(Number(slideCount) || 8, Math.min(14, typedTpl.requiredSections.length + 4))
+          : Math.max(7, Math.min(14, Number(slideCount) || 8));
 
       const templateAlignment = resolvedTpl
         ? `\nيجب بناء تسلسل الشرائح ومحتوى كل شريحة وملاحظات المعلم بحيث تتطابق مع أقسام وترتيب قالب/فورمة التحضير التالية:\n${promptBlock}`
@@ -2367,49 +2601,62 @@ ${langRule}`,
         ? `\nاعتمد كذلك على محتوى تحضير الدرس التالي لتفصيل كل قسم:\n${JSON.stringify(lessonPlan).slice(0, 4000)}`
         : "";
 
-      const response = await generateWithFallback(ai, {
-        contents: `صمّم عرضاً تقديمياً تعليمياً احترافياً من ${sectionCountHint} شرائح لدرس "${lesson?.title}" (${lesson?.subject} - ${lesson?.gradeLevel}) استناداً لمصادر الدرس:
+      const rawDeck = await callGeminiStructured<Partial<PresentationDeckData>>(
+        ai,
+        {
+          contents: `صمّم عرضاً تقديمياً تعليمياً احترافياً من ${sectionCountHint} شرائح لدرس "${lesson?.title}" (${lesson?.subject || "العلوم"} - ${lesson?.gradeLevel || ""}) استناداً لمصادر الدرس:
 ${sourcesText}
 ${templateAlignment}
 ${planAlignment}
-تأكد من وجود: شريحة عنوان (title)، الأهداف (objectives)، شرائح مفاهيم مرتبة وفق أقسام القالب (concept / example)، شريحة رسم علمي توضيحي (diagram)، سؤال تفاعلي (interactive_quiz)، وملخص وتقويم ختامي (summary).
+تأكد من تغطية البنية الكاملة للعرض:
+1) شريحة العنوان (title)
+2) المقدمة والتمهيد (concept)
+3) الأهداف التعليمية (objectives)
+4) شرح المحتوى العلمي والمفاهيم الأساسية + شريحة رسم علمي توضيحي (concept / diagram)
+5) الأنشطة والتطبيقات العملية (example)
+6) التقويم والأسئلة التفاعلية (interactive_quiz)
+7) الخاتمة والملخص الختامي (summary)
 ${langRule}`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              deckTitle: { type: Type.STRING },
-              subject: { type: Type.STRING },
-              gradeLevel: { type: Type.STRING },
-              themeAccent: { type: Type.STRING },
-              templateNameUsed: { type: Type.STRING },
-              slides: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    slideNumber: { type: Type.INTEGER },
-                    slideType: { type: Type.STRING },
-                    title: { type: Type.STRING },
-                    subtitle: { type: Type.STRING },
-                    bullets: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    speakerNotes: { type: Type.STRING },
-                    visualNote: { type: Type.STRING },
-                    quizQuestion: { type: Type.STRING },
-                    quizOptions: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    quizAnswerIndex: { type: Type.INTEGER },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                deckTitle: { type: Type.STRING },
+                subject: { type: Type.STRING },
+                gradeLevel: { type: Type.STRING },
+                themeAccent: { type: Type.STRING },
+                templateNameUsed: { type: Type.STRING },
+                slides: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      slideNumber: { type: Type.INTEGER },
+                      slideType: { type: Type.STRING },
+                      title: { type: Type.STRING },
+                      subtitle: { type: Type.STRING },
+                      bullets: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      speakerNotes: { type: Type.STRING },
+                      visualNote: { type: Type.STRING },
+                      quizQuestion: { type: Type.STRING },
+                      quizOptions: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      quizAnswerIndex: { type: Type.INTEGER },
+                    },
+                    required: ["slideNumber", "slideType", "title", "bullets", "speakerNotes"],
                   },
-                  required: ["slideNumber", "slideType", "title", "bullets", "speakerNotes"],
                 },
               },
+              required: ["deckTitle", "subject", "gradeLevel", "themeAccent", "slides"],
             },
-            required: ["deckTitle", "subject", "gradeLevel", "themeAccent", "slides"],
           },
         },
-      });
+        {
+          label: "Auto PPTX",
+          validate: (obj) => Array.isArray(obj.slides) && obj.slides.length > 0,
+        }
+      );
 
-      const rawDeck = JSON.parse((response.text ?? "{}").trim());
       const formattedDeck = formatTemplateStructuredDeck({
         rawDeck,
         lesson,
@@ -2512,43 +2759,52 @@ ${langRule}`,
         presenterPersona = "science_mentor",
         language = "ar",
       } = req.body ?? {};
+      if (!lesson || !String(lesson?.title || "").trim()) {
+        return res.status(400).json({
+          error: "MISSING_LESSON",
+          message: "يرجى اختيار درس أو إدخال عنوان الدرس قبل كتابة سيناريو الفيديو.",
+        });
+      }
       const sourcesText = buildSourcesText(lesson?.sources);
       const langRule = language === "en" ? "Write narration and subtitles in English." : "اكتب التعليق الصوتي والترجمة النصية بالعربية.";
 
-      const response = await generateWithFallback(ai, {
-        contents: `اكتب سيناريو فيديو تعليمياً مقسماً إلى 5 مشاهد قصيرة مترابطة لدرس "${lesson?.title}" (${lesson?.subject}).
+      const parsed = await callGeminiStructured<Record<string, unknown>>(
+        ai,
+        {
+          contents: `اكتب سيناريو فيديو تعليمياً مقسماً إلى 5 مشاهد قصيرة مترابطة لدرس "${lesson?.title}" (${lesson?.subject || "العلوم"}).
 الأسلوب: ${style}، الشخصية المقدمة: ${presenterPersona}.
 اعتمد على مصادر الدرس:
 ${sourcesText}
 ${langRule}`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              videoTitle: { type: Type.STRING },
-              fullScript: { type: Type.STRING },
-              scenes: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    sceneNumber: { type: Type.INTEGER },
-                    title: { type: Type.STRING },
-                    narration: { type: Type.STRING },
-                    subtitleText: { type: Type.STRING },
-                    visualCue: { type: Type.STRING },
-                    durationSec: { type: Type.INTEGER },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                videoTitle: { type: Type.STRING },
+                fullScript: { type: Type.STRING },
+                scenes: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      sceneNumber: { type: Type.INTEGER },
+                      title: { type: Type.STRING },
+                      narration: { type: Type.STRING },
+                      subtitleText: { type: Type.STRING },
+                      visualCue: { type: Type.STRING },
+                      durationSec: { type: Type.INTEGER },
+                    },
+                    required: ["sceneNumber", "title", "narration", "subtitleText", "visualCue", "durationSec"],
                   },
-                  required: ["sceneNumber", "title", "narration", "subtitleText", "visualCue", "durationSec"],
                 },
               },
+              required: ["videoTitle", "fullScript", "scenes"],
             },
-            required: ["videoTitle", "fullScript", "scenes"],
           },
         },
-      });
-      const parsed = JSON.parse((response.text ?? "{}").trim());
+        { label: "Video Script" }
+      );
       return res.json({
         project: {
           ...parsed,
@@ -2599,56 +2855,84 @@ ${langRule}`,
     }
   });
 
-  // 16. Generate Kahoot-style Competitive Quiz
-  app.post("/api/generate/kahoot-quiz", async (req, res) => {
+  // 16. Generate Competitive or Adaptive Quiz (aliases: /api/generate/quiz & /api/generate/kahoot-quiz)
+  const handleGenerateQuiz = async (req: express.Request, res: express.Response) => {
     const ai = getGeminiClient();
     if (!ai) {
       return res.status(503).json({ error: "GEMINI_NOT_CONFIGURED", message: "مفتاح GEMINI_API_KEY غير مهيأ." });
     }
     try {
-      const { lesson, questionCount = 6, language = "ar" } = req.body ?? {};
+      const {
+        lesson,
+        questionCount = 6,
+        language = "ar",
+        mode = "competitive",
+        studentLevel = "intermediate",
+        weakConcepts = [],
+      } = req.body ?? {};
+      if (!lesson || !String(lesson?.title || "").trim()) {
+        return res.status(400).json({
+          error: "MISSING_LESSON",
+          message: "يرجى اختيار درس أو إدخال عنوان الدرس قبل توليد الاختبار.",
+        });
+      }
       const sourcesText = buildSourcesText(lesson?.sources);
       const langRule = language === "en" ? "Write questions and options in English." : "اكتب الأسئلة والخيارات بالعربية.";
+      const adaptiveHint =
+        mode === "adaptive" || (Array.isArray(weakConcepts) && weakConcepts.length > 0)
+          ? `\nتكييف الصعوبة وفق مستوى الطالب (${studentLevel}) والتركيز على المفاهيم التالية: ${
+              Array.isArray(weakConcepts) && weakConcepts.length > 0 ? weakConcepts.join("، ") : "أساسيات الدرس"
+            }.`
+          : "";
 
-      const response = await generateWithFallback(ai, {
-        contents: `أنشئ مسابقة تفاعلية تنافسية من ${questionCount} أسئلة متنوعة (اختيار من متعدد mcq، صح وخطأ true_false، وأسئلة تفكير عليا higher_order) لدرس "${lesson?.title}" من المصادر:
-${sourcesText}
+      const quiz = await callGeminiStructured<Record<string, unknown>>(
+        ai,
+        {
+          contents: `أنشئ اختباراً تعليمياً من ${Math.min(15, Math.max(2, Number(questionCount) || 6))} أسئلة متنوعة (اختيار من متعدد mcq، صح وخطأ true_false، وأسئلة تفكير عليا higher_order) مرتبطة مباشرة بدرس "${lesson?.title}" من المصادر:
+${sourcesText}${adaptiveHint}
 ${langRule}`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              quizTitle: { type: Type.STRING },
-              lessonTitle: { type: Type.STRING },
-              questions: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING },
-                    questionType: { type: Type.STRING },
-                    question: { type: Type.STRING },
-                    options: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    correctIndex: { type: Type.INTEGER },
-                    timeLimitSec: { type: Type.INTEGER },
-                    points: { type: Type.INTEGER },
-                    explanation: { type: Type.STRING },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                quizTitle: { type: Type.STRING },
+                lessonTitle: { type: Type.STRING },
+                questions: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      id: { type: Type.STRING },
+                      questionType: { type: Type.STRING },
+                      question: { type: Type.STRING },
+                      options: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      correctIndex: { type: Type.INTEGER },
+                      timeLimitSec: { type: Type.INTEGER },
+                      points: { type: Type.INTEGER },
+                      explanation: { type: Type.STRING },
+                    },
+                    required: ["id", "questionType", "question", "options", "correctIndex", "timeLimitSec", "points", "explanation"],
                   },
-                  required: ["id", "questionType", "question", "options", "correctIndex", "timeLimitSec", "points", "explanation"],
                 },
               },
+              required: ["quizTitle", "lessonTitle", "questions"],
             },
-            required: ["quizTitle", "lessonTitle", "questions"],
           },
         },
-      });
-      return res.json({ quiz: JSON.parse((response.text ?? "{}").trim()) });
+        {
+          label: "Generate Quiz",
+          validate: (obj) => Array.isArray(obj.questions) && obj.questions.length > 0,
+        }
+      );
+      return res.json({ quiz });
     } catch (err) {
       const formatted = formatGeminiError(err);
       return res.status(formatted.status).json({ error: formatted.code, message: formatted.message });
     }
-  });
+  };
+  app.post("/api/generate/kahoot-quiz", handleGenerateQuiz);
+  app.post("/api/generate/quiz", handleGenerateQuiz);
 
   // 17. Generate Multi-Section Worksheet (Student + Teacher Answer Key)
   app.post("/api/generate/worksheet", async (req, res) => {
@@ -2658,112 +2942,122 @@ ${langRule}`,
     }
     try {
       const { lesson, language = "ar" } = req.body ?? {};
+      if (!lesson || !String(lesson?.title || "").trim()) {
+        return res.status(400).json({
+          error: "MISSING_LESSON",
+          message: "يرجى اختيار درس أو إدخال عنوان الدرس قبل توليد ورقة العمل.",
+        });
+      }
       const sourcesText = buildSourcesText(lesson?.sources);
       const langRule = language === "en" ? "Write the worksheet in English." : "اكتب ورقة العمل بالعربية.";
 
-      const response = await generateWithFallback(ai, {
-        contents: `أعد ورقة عمل شاملة لدرس "${lesson?.title}" (${lesson?.subject} - ${lesson?.gradeLevel}) من المصادر:
+      const worksheet = await callGeminiStructured<Record<string, unknown>>(
+        ai,
+        {
+          contents: `أعد ورقة عمل شاملة لدرس "${lesson?.title}" (${lesson?.subject || "العلوم"} - ${lesson?.gradeLevel || ""}) من المصادر:
 ${sourcesText}
 يجب أن تضم: أسئلة متنوعة، نشاط تطبيقي، أكمل الفراغات، مطابقة، تصنيف، حل مسائل/تدريبات، وأسئلة تفكير عليا مع إجابات المعلم.
 ${langRule}`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              worksheetTitle: { type: Type.STRING },
-              subject: { type: Type.STRING },
-              gradeLevel: { type: Type.STRING },
-              studentInstructions: { type: Type.STRING },
-              variedQuestions: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: { question: { type: Type.STRING }, answer: { type: Type.STRING } },
-                  required: ["question", "answer"],
-                },
-              },
-              practicalActivity: {
-                type: Type.OBJECT,
-                properties: {
-                  title: { type: Type.STRING },
-                  steps: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  expectedOutcome: { type: Type.STRING },
-                },
-                required: ["title", "steps", "expectedOutcome"],
-              },
-              fillInBlanks: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: { sentence: { type: Type.STRING }, missingWord: { type: Type.STRING } },
-                  required: ["sentence", "missingWord"],
-                },
-              },
-              matchingPairs: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: { leftItem: { type: Type.STRING }, rightMatch: { type: Type.STRING } },
-                  required: ["leftItem", "rightMatch"],
-                },
-              },
-              classificationTask: {
-                type: Type.OBJECT,
-                properties: {
-                  prompt: { type: Type.STRING },
-                  categories: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        categoryName: { type: Type.STRING },
-                        items: { type: Type.ARRAY, items: { type: Type.STRING } },
-                      },
-                      required: ["categoryName", "items"],
-                    },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                worksheetTitle: { type: Type.STRING },
+                subject: { type: Type.STRING },
+                gradeLevel: { type: Type.STRING },
+                studentInstructions: { type: Type.STRING },
+                variedQuestions: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: { question: { type: Type.STRING }, answer: { type: Type.STRING } },
+                    required: ["question", "answer"],
                   },
                 },
-                required: ["prompt", "categories"],
-              },
-              problemSolving: {
-                type: Type.ARRAY,
-                items: {
+                practicalActivity: {
                   type: Type.OBJECT,
                   properties: {
-                    problem: { type: Type.STRING },
-                    solutionSteps: { type: Type.STRING },
-                    finalAnswer: { type: Type.STRING },
+                    title: { type: Type.STRING },
+                    steps: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    expectedOutcome: { type: Type.STRING },
                   },
-                  required: ["problem", "solutionSteps", "finalAnswer"],
+                  required: ["title", "steps", "expectedOutcome"],
                 },
-              },
-              higherOrderThinking: {
-                type: Type.ARRAY,
-                items: {
+                fillInBlanks: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: { sentence: { type: Type.STRING }, missingWord: { type: Type.STRING } },
+                    required: ["sentence", "missingWord"],
+                  },
+                },
+                matchingPairs: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: { leftItem: { type: Type.STRING }, rightMatch: { type: Type.STRING } },
+                    required: ["leftItem", "rightMatch"],
+                  },
+                },
+                classificationTask: {
                   type: Type.OBJECT,
-                  properties: { question: { type: Type.STRING }, modelAnswer: { type: Type.STRING } },
-                  required: ["question", "modelAnswer"],
+                  properties: {
+                    prompt: { type: Type.STRING },
+                    categories: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          categoryName: { type: Type.STRING },
+                          items: { type: Type.ARRAY, items: { type: Type.STRING } },
+                        },
+                        required: ["categoryName", "items"],
+                      },
+                    },
+                  },
+                  required: ["prompt", "categories"],
+                },
+                problemSolving: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      problem: { type: Type.STRING },
+                      solutionSteps: { type: Type.STRING },
+                      finalAnswer: { type: Type.STRING },
+                    },
+                    required: ["problem", "solutionSteps", "finalAnswer"],
+                  },
+                },
+                higherOrderThinking: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: { question: { type: Type.STRING }, modelAnswer: { type: Type.STRING } },
+                    required: ["question", "modelAnswer"],
+                  },
                 },
               },
+              required: [
+                "worksheetTitle",
+                "subject",
+                "gradeLevel",
+                "studentInstructions",
+                "variedQuestions",
+                "practicalActivity",
+                "fillInBlanks",
+                "matchingPairs",
+                "classificationTask",
+                "problemSolving",
+                "higherOrderThinking",
+              ],
             },
-            required: [
-              "worksheetTitle",
-              "subject",
-              "gradeLevel",
-              "studentInstructions",
-              "variedQuestions",
-              "practicalActivity",
-              "fillInBlanks",
-              "matchingPairs",
-              "classificationTask",
-              "problemSolving",
-              "higherOrderThinking",
-            ],
           },
         },
-      });
-      return res.json({ worksheet: JSON.parse((response.text ?? "{}").trim()) });
+        { label: "Worksheet" }
+      );
+      return res.json({ worksheet });
     } catch (err) {
       const formatted = formatGeminiError(err);
       return res.status(formatted.status).json({ error: formatted.code, message: formatted.message });
@@ -2810,66 +3104,52 @@ ${langRule}`,
           ? `Generate one surprising, scientifically accurate Daily Science Fact for date ${dateKey} with primary focus on ${focusDiscipline} (or an inspiring connection across science). Keep it clear, memorable, and motivating for school students and teachers logging in today.`
           : `ولّد حقيقة علمية يومية مدهشة ودقيقة علمياً لتاريخ ${dateKey} مع تركيز أساسي على مجال ${focusDiscipline} (أو ربط ملهم بالعلوم والرياضيات). اجعل الصياغة عربية فصيحة سلسة، مشوقة ومفهومة للطلاب والمعلمين عند تسجيل دخولهم اليومي.`;
 
-      let responseText = "";
-      let lastErr: unknown = null;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          const response = await generateWithFallback(ai, {
-            contents: prompt,
-            config: {
-              systemInstruction:
-                lang === "en"
-                  ? "You are a distinguished science communicator for Smart Science AI. Provide verified, fascinating, student-friendly daily science facts in JSON."
-                  : "أنت خبير تبسيط علمي في منصة Smart Science AI. قدّم حقائق علمية يومية موثقة ومشوقة بلغة عربية واضحة بصيغة JSON.",
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  discipline: {
-                    type: Type.STRING,
-                    description: "Science subject area such as Chemistry, Physics, Biology, Geology, or Mathematics.",
-                  },
-                  headline: {
-                    type: Type.STRING,
-                    description: "Short engaging headline (under 10 words).",
-                  },
-                  fact: {
-                    type: Type.STRING,
-                    description: "Clear, accurate 2-3 sentence scientific fact.",
-                  },
-                  whyItMatters: {
-                    type: Type.STRING,
-                    description: "1 concise sentence connecting the fact to everyday life or science discovery.",
-                  },
-                  quickPrompt: {
-                    type: Type.STRING,
-                    description: "A curious follow-up question a student can ask the AI robot about this fact.",
-                  },
+      const parsed = await callGeminiStructured<{
+        discipline?: string;
+        headline?: string;
+        fact?: string;
+        whyItMatters?: string;
+        quickPrompt?: string;
+      }>(
+        ai,
+        {
+          contents: prompt,
+          config: {
+            systemInstruction:
+              lang === "en"
+                ? "You are a distinguished science communicator for Smart Science AI. Provide verified, fascinating, student-friendly daily science facts in JSON."
+                : "أنت خبير تبسيط علمي في منصة Smart Science AI. قدّم حقائق علمية يومية موثقة ومشوقة بلغة عربية واضحة بصيغة JSON.",
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                discipline: {
+                  type: Type.STRING,
+                  description: "Science subject area such as Chemistry, Physics, Biology, Geology, or Mathematics.",
                 },
-                required: ["discipline", "headline", "fact", "whyItMatters", "quickPrompt"],
+                headline: {
+                  type: Type.STRING,
+                  description: "Short engaging headline (under 10 words).",
+                },
+                fact: {
+                  type: Type.STRING,
+                  description: "Clear, accurate 2-3 sentence scientific fact.",
+                },
+                whyItMatters: {
+                  type: Type.STRING,
+                  description: "1 concise sentence connecting the fact to everyday life or science discovery.",
+                },
+                quickPrompt: {
+                  type: Type.STRING,
+                  description: "A curious follow-up question a student can ask the AI robot about this fact.",
+                },
               },
+              required: ["discipline", "headline", "fact", "whyItMatters", "quickPrompt"],
             },
-          });
-          responseText = (response.text ?? "{}").trim();
-          lastErr = null;
-          break;
-        } catch (err) {
-          lastErr = err;
-          const formatted = formatGeminiError(err);
-          if (formatted.status !== 503 && formatted.status !== 429) {
-            throw err;
-          }
-          if (attempt < 2) {
-            await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
-          }
-        }
-      }
-
-      if (lastErr) {
-        throw lastErr;
-      }
-
-      const parsed = JSON.parse(responseText || "{}");
+          },
+        },
+        { label: "Daily Fact", maxTransientRetries: 3 }
+      );
       const factPayload = {
         date: dateKey,
         lang,

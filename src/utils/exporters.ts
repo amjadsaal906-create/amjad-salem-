@@ -266,15 +266,19 @@ export async function exportPresentationPptx(
   pptx.rtlMode = rtl;
   pptx.title = deck.deckTitle;
   pptx.subject = deck.subject;
+  pptx.author = "Smart Science AI";
 
-  const accent = (deck.themeAccent || "#0284C7").replace("#", "");
+  const accent = (deck.themeAccent || "#0F766E").replace("#", "");
   const diagramDataUrl = diagramUrl ? await imageUrlToDataUrl(diagramUrl) : null;
+  const totalSlides = deck.slides.length || 1;
+  const fontFace = rtl ? "IBM Plex Sans Arabic" : "Plus Jakarta Sans";
 
   for (const slideItem of deck.slides) {
     const slide = pptx.addSlide();
-    slide.background = { color: slideItem.slideType === "title" ? "0F172A" : "F8FAFC" };
+    const isTitleSlide = slideItem.slideType === "title";
+    slide.background = { color: isTitleSlide ? "0F172A" : "F8FAFC" };
 
-    // Top accent bar
+    // Top accent bar across 16:9 width
     slide.addShape(pptx.ShapeType.rect, {
       x: 0,
       y: 0,
@@ -284,42 +288,79 @@ export async function exportPresentationPptx(
       line: { color: accent },
     });
 
-    if (slideItem.slideType === "title") {
+    if (isTitleSlide) {
       slide.addText(slideItem.title, {
-        x: 0.8,
-        y: 1.7,
-        w: 8.4,
-        h: 1.4,
+        x: 0.75,
+        y: 1.55,
+        w: 8.5,
+        h: 1.5,
         fontSize: 32,
         bold: true,
         color: "FFFFFF",
+        fontFace,
         align: rtl ? "right" : "left",
         rtlMode: rtl,
       });
-      slide.addText(slideItem.subtitle || `${deck.subject} · ${deck.gradeLevel}`, {
-        x: 0.8,
-        y: 3.2,
-        w: 8.4,
-        h: 0.8,
-        fontSize: 18,
+
+      const subLine =
+        slideItem.subtitle ||
+        `${deck.subject} · ${deck.gradeLevel}${
+          deck.templateNameUsed ? ` · ${deck.templateNameUsed}` : ""
+        }`;
+
+      slide.addText(subLine, {
+        x: 0.75,
+        y: 3.15,
+        w: 8.5,
+        h: 0.85,
+        fontSize: 17,
         color: "CBD5E1",
+        fontFace,
         align: rtl ? "right" : "left",
         rtlMode: rtl,
       });
+
+      if (deck.templateNameUsed) {
+        slide.addText(
+          rtl
+            ? `مبني وفق فورمة التحضير المعتمدة: ${deck.templateNameUsed}`
+            : `Aligned to Preparation Form: ${deck.templateNameUsed}`,
+          {
+            x: 0.75,
+            y: 4.7,
+            w: 8.5,
+            h: 0.4,
+            fontSize: 12,
+            color: "94A3B8",
+            fontFace,
+            align: rtl ? "right" : "left",
+            rtlMode: rtl,
+          }
+        );
+      }
     } else {
       slide.addText(slideItem.title, {
         x: 0.6,
         y: 0.35,
         w: 8.8,
-        h: 0.65,
-        fontSize: 24,
+        h: 0.62,
+        fontSize: 23,
         bold: true,
         color: "0F172A",
+        fontFace,
         align: rtl ? "right" : "left",
         rtlMode: rtl,
       });
 
-      const hasDiagram = slideItem.slideType === "diagram" && diagramDataUrl;
+      slide.addShape(pptx.ShapeType.line, {
+        x: 0.6,
+        y: 1.05,
+        w: 8.8,
+        h: 0,
+        line: { color: "CBD5E1", width: 1 },
+      });
+
+      const hasDiagram = slideItem.slideType === "diagram" && Boolean(diagramDataUrl);
       const textWidth = hasDiagram ? 4.4 : 8.8;
       const textX = hasDiagram ? (rtl ? 5.0 : 0.6) : 0.6;
 
@@ -329,42 +370,68 @@ export async function exportPresentationPptx(
           x: rtl ? 0.6 : 5.2,
           y: 1.25,
           w: 4.1,
-          h: 3.1,
+          h: 3.2,
         });
       }
 
+      const rawBullets = Array.isArray(slideItem.bullets)
+        ? slideItem.bullets.map((b) => String(b || "").trim()).filter(Boolean)
+        : [];
       const bodyLines =
         slideItem.slideType === "interactive_quiz" && slideItem.quizQuestion
-          ? [slideItem.quizQuestion, ...(slideItem.quizOptions || []).map((o, idx) => `${idx + 1}. ${o}`)]
-          : slideItem.bullets;
+          ? [
+              slideItem.quizQuestion,
+              ...(slideItem.quizOptions || []).map((o, idx) => `${idx + 1}. ${o}`),
+            ]
+          : rawBullets.length > 0
+            ? rawBullets
+            : slideItem.speakerNotes
+              ? [slideItem.speakerNotes]
+              : slideItem.subtitle
+                ? [slideItem.subtitle]
+                : [];
 
-      slide.addText(
-        bodyLines.map((line) => ({
-          text: line,
-          options: { bullet: slideItem.slideType !== "interactive_quiz", breakLine: true },
-        })),
-        {
-          x: textX,
-          y: 1.25,
-          w: textWidth,
-          h: 3.7,
-          fontSize: 16,
-          color: "1E293B",
-          align: rtl ? "right" : "left",
-          valign: "top",
-          rtlMode: rtl,
-          paraSpaceAfter: 10,
-        }
-      );
+      if (bodyLines.length > 0) {
+        slide.addText(
+          bodyLines.map((line) => ({
+            text: line,
+            options: { bullet: slideItem.slideType !== "interactive_quiz", breakLine: true },
+          })),
+          {
+            x: textX,
+            y: 1.25,
+            w: textWidth,
+            h: 3.75,
+            fontSize: 16,
+            color: "1E293B",
+            fontFace,
+            align: rtl ? "right" : "left",
+            valign: "top",
+            rtlMode: rtl,
+            paraSpaceAfter: 10,
+          }
+        );
+      }
 
-      slide.addText(`${deck.subject} · ${slideItem.slideNumber}/${deck.slides.length}`, {
+      const footerMeta = [
+        deck.subject,
+        deck.gradeLevel,
+        deck.templateNameUsed || undefined,
+        `${slideItem.slideNumber}/${totalSlides}`,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+
+      slide.addText(footerMeta, {
         x: 0.6,
         y: 5.15,
         w: 8.8,
         h: 0.3,
         fontSize: 10,
         color: "64748B",
-        align: rtl ? "left" : "right",
+        fontFace,
+        align: rtl ? "right" : "left",
+        rtlMode: rtl,
       });
     }
 
@@ -373,7 +440,13 @@ export async function exportPresentationPptx(
     }
   }
 
-  await pptx.writeFile({ fileName: `${deck.deckTitle.replace(/\s+/g, "_")}.pptx` });
+  const safeTitle = (deck.deckTitle || "lesson_presentation")
+    .trim()
+    .replace(/[\\/:*?"<>|]+/g, "")
+    .replace(/\s+/g, "_")
+    .slice(0, 64);
+
+  await pptx.writeFile({ fileName: `${safeTitle || "lesson_presentation"}.pptx` });
 }
 
 export function printHtmlAsPdf(title: string, htmlBody: string, dir: "rtl" | "ltr"): void {

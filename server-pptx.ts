@@ -126,21 +126,24 @@ export function formatTemplateStructuredDeck(params: {
     "";
 
   const slides: PresentationSlide[] = Array.isArray(rawDeck?.slides)
-    ? rawDeck.slides.map((sl, idx) => ({
-        slideNumber: idx + 1,
-        slideType: (sl.slideType as PresentationSlide["slideType"]) || "concept",
-        title: String(sl.title || `${isAr ? "شريحة" : "Slide"} ${idx + 1}`).trim(),
-        subtitle: sl.subtitle ? String(sl.subtitle).trim() : undefined,
-        bullets: normalizeBullets(sl.bullets, sl.speakerNotes),
-        speakerNotes: String(sl.speakerNotes || "").trim(),
-        visualNote: sl.visualNote ? String(sl.visualNote).trim() : undefined,
-        quizQuestion: sl.quizQuestion ? String(sl.quizQuestion).trim() : undefined,
-        quizOptions: Array.isArray(sl.quizOptions)
-          ? sl.quizOptions.map((o) => String(o).trim()).filter(Boolean)
-          : undefined,
-        quizAnswerIndex:
-          typeof sl.quizAnswerIndex === "number" ? sl.quizAnswerIndex : undefined,
-      }))
+    ? rawDeck.slides.map((sl, idx) => {
+        const bullets = normalizeBullets(sl.bullets, sl.speakerNotes || sl.subtitle);
+        return {
+          slideNumber: idx + 1,
+          slideType: (sl.slideType as PresentationSlide["slideType"]) || "concept",
+          title: String(sl.title || `${isAr ? "شريحة" : "Slide"} ${idx + 1}`).trim(),
+          subtitle: sl.subtitle ? String(sl.subtitle).trim() : undefined,
+          bullets,
+          speakerNotes: String(sl.speakerNotes || "").trim(),
+          visualNote: sl.visualNote ? String(sl.visualNote).trim() : undefined,
+          quizQuestion: sl.quizQuestion ? String(sl.quizQuestion).trim() : undefined,
+          quizOptions: Array.isArray(sl.quizOptions)
+            ? sl.quizOptions.map((o) => String(o).trim()).filter(Boolean)
+            : undefined,
+          quizAnswerIndex:
+            typeof sl.quizAnswerIndex === "number" ? sl.quizAnswerIndex : undefined,
+        };
+      })
     : [];
 
   // Ensure every requiredSection in the selected PreparationTemplate is represented
@@ -182,7 +185,7 @@ export function formatTemplateStructuredDeck(params: {
     }
   }
 
-  // Fallback deterministic slide builder strictly from lessonPlan + prepTemplate
+  // Fallback deterministic slide builder strictly from edited lessonPlan + prepTemplate
   // if no AI slide array was passed (e.g., direct export from edited lesson plan).
   if (slides.length === 0 && lessonPlan) {
     slides.push({
@@ -196,13 +199,23 @@ export function formatTemplateStructuredDeck(params: {
       speakerNotes: `${isAr ? "مقدمة الدرس:" : "Lesson intro:"} ${deckTitle}`,
     });
 
+    if (lessonPlan.warmUp) {
+      slides.push({
+        slideNumber: slides.length + 1,
+        slideType: "concept",
+        title: isAr ? "المقدمة والتمهيد" : "Introduction & Warm-up",
+        bullets: normalizeBullets(null, lessonPlan.warmUp),
+        speakerNotes: lessonPlan.warmUp,
+      });
+    }
+
     if (lessonPlan.objectives?.length) {
       slides.push({
-        slideNumber: 2,
+        slideNumber: slides.length + 1,
         slideType: "objectives",
         title: isAr ? "الأهداف التعليمية" : "Learning Objectives",
         bullets: lessonPlan.objectives.slice(0, 6),
-        speakerNotes: lessonPlan.warmUp || "",
+        speakerNotes: lessonPlan.objectives.join(" · "),
       });
     }
 
@@ -218,37 +231,51 @@ export function formatTemplateStructuredDeck(params: {
         });
       }
     } else {
-      if (lessonPlan.warmUp) {
+      if (lessonPlan.teachingStrategies?.length || lesson?.summary) {
         slides.push({
           slideNumber: slides.length + 1,
           slideType: "concept",
-          title: isAr ? "التمهيد والتهيئة" : "Warm-up & Hook",
-          bullets: normalizeBullets(null, lessonPlan.warmUp),
-          speakerNotes: lessonPlan.warmUp,
+          title: isAr ? "المحتوى العلمي والاستراتيجيات" : "Scientific Content & Strategies",
+          bullets: [
+            ...(lesson?.summary ? [lesson.summary] : []),
+            ...(lessonPlan.teachingStrategies || []),
+          ].slice(0, 6),
+          speakerNotes: lesson?.summary || (lessonPlan.teachingStrategies || []).join(" · "),
         });
       }
       if (lessonPlan.learningActivities?.length) {
         slides.push({
           slideNumber: slides.length + 1,
           slideType: "example",
-          title: isAr ? "الأنشطة والتجارب التعليمية" : "Learning Activities",
+          title: isAr ? "الأنشطة والتطبيقات العملية" : "Activities & Practice",
           bullets: lessonPlan.learningActivities.slice(0, 6),
-          speakerNotes: (lessonPlan.teachingStrategies || []).join(" · "),
-        });
-      }
-      if (lessonPlan.assessment || lessonPlan.homework) {
-        slides.push({
-          slideNumber: slides.length + 1,
-          slideType: "summary",
-          title: isAr ? "التقويم والواجب المنزلي" : "Assessment & Homework",
-          bullets: [
-            ...(lessonPlan.assessment ? [lessonPlan.assessment] : []),
-            ...(lessonPlan.homework ? [lessonPlan.homework] : []),
-          ].slice(0, 5),
-          speakerNotes: lessonPlan.differentiationAndInclusion || "",
+          speakerNotes: (lessonPlan.learningActivities || []).join(" · "),
         });
       }
     }
+
+    if (lessonPlan.assessment) {
+      slides.push({
+        slideNumber: slides.length + 1,
+        slideType: "example",
+        title: isAr ? "التقويم والتحقق من الفهم" : "Assessment & Check for Understanding",
+        bullets: normalizeBullets(null, lessonPlan.assessment),
+        speakerNotes: lessonPlan.assessment,
+      });
+    }
+
+    slides.push({
+      slideNumber: slides.length + 1,
+      slideType: "summary",
+      title: isAr ? "الخاتمة والملخص والواجب" : "Conclusion, Summary & Homework",
+      bullets: [
+        ...(lessonPlan.homework ? [`${isAr ? "الواجب المنزلي:" : "Homework:"} ${lessonPlan.homework}`] : []),
+        ...(lessonPlan.differentiationAndInclusion
+          ? [`${isAr ? "مراعاة الفروق:" : "Inclusion:"} ${lessonPlan.differentiationAndInclusion}`]
+          : []),
+      ].slice(0, 5),
+      speakerNotes: [lessonPlan.homework, lessonPlan.differentiationAndInclusion].filter(Boolean).join(" · "),
+    });
   }
 
   // Re-number sequentially 1..N

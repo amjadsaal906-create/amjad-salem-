@@ -30,6 +30,7 @@ import { CARTOON_AVATARS, CartoonAvatar } from "./CartoonAvatars.tsx";
 import { QrCodeBox } from "./QrCodeBox.tsx";
 import { gameAudio } from "../utils/gameAudio.ts";
 import type { AccessibilitySettings, LessonData, QuizParticipant, UILanguage } from "../types.ts";
+import { fetchLessonArtifacts, generateQuiz, saveLessonArtifact } from "../utils/aiApi.ts";
 
 interface QuizBuzzerMapGameProps {
   lesson: LessonData;
@@ -328,13 +329,12 @@ export const QuizBuzzerMapGame: React.FC<QuizBuzzerMapGameProps> = ({
     let cancelled = false;
     setStages(buildStagePool(lesson, allLessons));
 
-    fetch(`/api/artifacts?lessonId=${encodeURIComponent(lesson.id)}`)
-      .then((r) => r.json())
-      .then((d) => {
+    fetchLessonArtifacts(lesson.id)
+      .then((artifacts) => {
         if (cancelled) return;
-        const found = (d.artifacts || []).find(
-          (a: { artifactType: string }) => a.artifactType === "kahoot_quiz"
-        );
+        const found = artifacts.find((a) => a.artifactType === "kahoot_quiz") as
+          | { data?: { questions?: Parameters<typeof buildStagePool>[2] } }
+          | undefined;
         if (found?.data?.questions) {
           const merged = buildStagePool(lesson, allLessons, found.data.questions);
           if (merged.length > 0) setStages(merged);
@@ -543,17 +543,12 @@ export const QuizBuzzerMapGame: React.FC<QuizBuzzerMapGameProps> = ({
     setGenError(null);
     setGenStatus(null);
     try {
-      const res = await fetch("/api/generate/kahoot-quiz", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          lesson,
-          questionCount: 6,
-          language: uiLang,
-        }),
+      const data = await generateQuiz({
+        lesson,
+        questionCount: 6,
+        language: uiLang,
       });
-      const data = await res.json();
-      if (!res.ok || !Array.isArray(data.quiz?.questions) || data.quiz.questions.length === 0) {
+      if (!Array.isArray(data.quiz?.questions) || data.quiz.questions.length === 0) {
         throw new Error(
           data.message || (isAr ? "تعذر توليد مراحل الأسئلة للدرس." : "Could not generate lesson stages.")
         );
@@ -585,16 +580,12 @@ export const QuizBuzzerMapGame: React.FC<QuizBuzzerMapGameProps> = ({
         };
       });
 
-      await fetch("/api/artifacts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          lessonId: lesson.id,
-          artifactType: "kahoot_quiz",
-          title: data.quiz.quizTitle || lesson.title,
-          data: data.quiz,
-        }),
-      });
+      saveLessonArtifact({
+        lessonId: lesson.id,
+        artifactType: "kahoot_quiz",
+        title: data.quiz.quizTitle || lesson.title,
+        data: data.quiz,
+      }).catch(() => {});
 
       setStages(built);
       initFreshCampaign(built);

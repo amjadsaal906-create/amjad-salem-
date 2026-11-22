@@ -33,6 +33,11 @@ import {
   speakWithGeminiTTS,
   stopAllSpeech,
 } from "../utils/speech.ts";
+import {
+  describeScienceImage,
+  simplifyScienceText,
+  transcribeMediaAudio,
+} from "../utils/aiApi.ts";
 
 interface InclusiveLearningHubProps {
   lesson: LessonData;
@@ -190,27 +195,24 @@ export const InclusiveLearningHub: React.FC<InclusiveLearningHubProps> = ({
     setSttError(null);
     try {
       const audioBase64 = await blobToBase64(blob);
-      const res = await fetch("/api/stt", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          audioBase64,
-          mimeType: blob.type || "audio/webm",
-          mode,
-          language: uiLang,
-        }),
+      const data = await transcribeMediaAudio({
+        audioBase64,
+        mimeType: blob.type || "audio/webm",
+        mode,
+        language: uiLang,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setSttError(data.message || (isAr ? "فشل تفريغ الملف الصوتي/المرئي." : "Media transcription failed."));
-      } else {
-        setSttTranscript(data.transcript || "");
-        setSttCaptions(data.captions || []);
-        setTimedCaptions(data.timedCaptions || []);
-        setVttContent(data.vtt || "");
-      }
-    } catch {
-      setSttError(isAr ? "تعذر الاتصال بخدمة تحويل الكلام إلى نص." : "Failed to reach STT service.");
+      setSttTranscript(data.transcript || "");
+      setSttCaptions(data.captions || []);
+      setTimedCaptions(data.timedCaptions || []);
+      setVttContent(data.vtt || "");
+    } catch (err) {
+      setSttError(
+        err instanceof Error
+          ? err.message
+          : isAr
+            ? "تعذر الاتصال بخدمة تحويل الكلام إلى نص."
+            : "Failed to reach STT service."
+      );
     } finally {
       setSttLoading(false);
     }
@@ -257,23 +259,20 @@ export const InclusiveLearningHub: React.FC<InclusiveLearningHubProps> = ({
       setVisionLoading(true);
       setVisionError(null);
       try {
-        const res = await fetch("/api/describe-image", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            imageBase64: base64,
-            mimeType: file.type || "image/png",
-            lessonTitle: lesson.title,
-          }),
+        const data = await describeScienceImage({
+          imageBase64: base64,
+          mimeType: file.type || "image/png",
+          lessonTitle: lesson.title,
         });
-        const data = await res.json();
-        if (!res.ok) {
-          setVisionError(data.message || (isAr ? "تعذر وصف الصورة." : "Could not describe image."));
-        } else {
-          setVisionResult(data);
-        }
-      } catch {
-        setVisionError(isAr ? "تعذر الاتصال بخدمة وصف الصور." : "Vision service unreachable.");
+        setVisionResult(data);
+      } catch (err) {
+        setVisionError(
+          err instanceof Error
+            ? err.message
+            : isAr
+              ? "تعذر الاتصال بخدمة وصف الصور."
+              : "Vision service unreachable."
+        );
       } finally {
         setVisionLoading(false);
       }
@@ -289,22 +288,19 @@ export const InclusiveLearningHub: React.FC<InclusiveLearningHubProps> = ({
     setSimplifyLoading(true);
     setSimplifyError(null);
     try {
-      const res = await fetch("/api/simplify", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: textToSimplify,
-          lessonTitle: lesson.title,
-        }),
+      const data = await simplifyScienceText({
+        text: textToSimplify,
+        lessonTitle: lesson.title,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setSimplifyError(data.message || (isAr ? "تعذر تبسيط النص." : "Simplification failed."));
-      } else {
-        setSimplifiedSteps(data.steps || []);
-      }
-    } catch {
-      setSimplifyError(isAr ? "تعذر الاتصال بخدمة التبسيط." : "Simplification service unreachable.");
+      setSimplifiedSteps(data.steps || []);
+    } catch (err) {
+      setSimplifyError(
+        err instanceof Error
+          ? err.message
+          : isAr
+            ? "تعذر الاتصال بخدمة التبسيط."
+            : "Simplification service unreachable."
+      );
     } finally {
       setSimplifyLoading(false);
     }
